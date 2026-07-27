@@ -1,5 +1,7 @@
 # Coherent SVM
 
+Public repository: <https://github.com/yongqiu-star/coherent-svm>
+
 This repository is a clean, path-independent research artifact for studying
 coherent low-precision execution in nonlinear RBF SVM training. It is an
 integration overlay for RAPIDS cuML 26.06.00 rather than a standalone SVM
