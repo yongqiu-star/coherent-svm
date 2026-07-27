@@ -53,7 +53,7 @@ intended to validate:
   \item representation coherence across the full state transition;
   \item cache hit/miss semantics and equal-logical-capacity comparisons;
   \item integration of materialization, local solve, and global update; and
-  \item normalized timing, quality, and numerical outputs.
+  \item normalized timing and held-out-quality outputs.
 \end{itemize}
 
 The reference backend is not claimed to reproduce the reported
@@ -84,6 +84,10 @@ encoding a host, user, or private workspace. The central files are listed in
 This schema makes the artifact useful even on hardware that cannot reproduce
 the optimized backend: the semantic contract and the experiment denominator
 remain inspectable and comparable.
+
+The public runner does not automate the independent FP32-objective KKT audit
+used in the report. That audit remains a model-difference diagnostic rather
+than the convergence definition of the coherent low-precision solver.
 
 \subsection{Transferable lesson}
 

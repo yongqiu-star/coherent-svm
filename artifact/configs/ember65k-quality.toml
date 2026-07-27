@@ -25,4 +25,4 @@ cache_size_mib = 1024
 [evaluation]
 rows = 65536
 held_out_dataset = "ember2018-test200k"
-metrics = ["accuracy", "roc_auc", "mcnemar", "score_correlation", "fp32_kkt_audit"]
+metrics = ["accuracy", "roc_auc", "mcnemar", "score_correlation"]

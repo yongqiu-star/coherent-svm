@@ -12,18 +12,18 @@
     \midrule
     Portable numerical correctness &
       \path{tests/test_portable_backend_gpu.py} and
-      \path{smoke-synthetic.toml} &
+      \path{artifact/configs/smoke-synthetic.toml} &
       Compares FP32 and FP16 cache materialization and the full
       $K\Delta\alpha$ update with an explicit RBF oracle; also exercises the
       patched solver end to end. \\
     Matched performance protocol &
-      \path{ember65k-ab.toml} and
-      \path{reference/pro6000.json} &
+      \path{artifact/configs/ember65k-ab.toml} and
+      \path{artifact/reference/pro6000.json} &
       Encodes equal logical cache capacity and balanced repetitions. The
       public portable backend does not reproduce the 1.351$\times$
       architecture-tuned result. \\
     Held-out quality protocol &
-      \path{ember65k-quality.toml} &
+      \path{artifact/configs/ember65k-quality.toml} &
       Runs stock FP32 and coherent FP16 on one held-out split and summarizes
       accuracy, AUC, disagreements, McNemar's exact test, and score
       correlation. It is not an equivalence proof. \\
@@ -68,8 +68,7 @@ export CUML_SOURCE=<path-to-cuml-26.06.00>
 export CUVS_INCLUDE=<path-to-cuvs-include>
 git -C "$CUML_SOURCE" apply \
   "$PWD/patches/cuml-26.06.00/coherent-fp16.patch"
-CUML_SOURCE="$CUML_SOURCE" CUVS_INCLUDE="$CUVS_INCLUDE" \
-  scripts/build.sh
+PYTHON="$PWD/.venv/bin/python" scripts/build.sh
 
 COHERENT_SVM_LIBRARY=build/libcoherent_svm.so \
   uv run pytest -q
@@ -83,7 +82,11 @@ The main prepared-data protocol replaces the smoke configuration with
 \path{artifact/configs/ember65k-ab.toml} and adds
 \code{--data-root <prepared-data-root>}. Dataset arrays remain external to the
 repository; their normalized layout is documented in
-\path{artifact/README.md}.
+\path{artifact/README.md}. The release specifies the prepared-array contract
+but does not include EMBER's feature-extraction pipeline.
+The complete patched-solver reproduction path currently requires compute
+capability 12.0; the standalone portable-backend oracle test builds for the
+local CUDA architecture.
 
 \section{Normalized Output Contract}
 \label{app:output-contract}

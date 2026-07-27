@@ -106,15 +106,18 @@ for the exact provenance and redistribution boundary.
 
 ## Requirements
 
-- Linux with an NVIDIA GPU;
+- Linux with a compute-capability 12.0 (`sm_120`) NVIDIA GPU for the complete
+  patched-solver `reproduce` path;
 - CUDA 13.x, CMake 3.26+, Ninja, and Python 3.11+;
 - cuML/libcuml 26.06.00 with RAFT, RMM, cuVS, and rapids_logger headers; and
 - [`uv`](https://docs.astral.sh/uv/) for the locked Python environment.
 
-The unpublished tuned backend targets `sm_120a`. The included reference
-backend uses cuBLAS and builds for the local CUDA architecture. The current
-overlay exposes the coherent path for dense workloads with at least 65,536
-rows and a Tensor-Core-suitable feature shape.
+The unpublished tuned backend targets `sm_120a`. The standalone portable
+backend uses cuBLAS and builds for the local CUDA architecture, but the current
+cuML overlay activates its complete coherent solver path only on compute
+capability 12.0. `coherent-svm doctor` reports this gate explicitly. Dense
+coherent runs additionally require at least 65,536 rows and a
+Tensor-Core-suitable feature shape.
 
 ## Quick start
 
@@ -130,7 +133,7 @@ export CUVS_INCLUDE=/path/to/cuvs/include
 git -C "$CUML_SOURCE" apply \
   "$PWD/patches/cuml-26.06.00/coherent-fp16.patch"
 
-CUML_SOURCE="$CUML_SOURCE" scripts/build.sh
+PYTHON="$PWD/.venv/bin/python" scripts/build.sh
 
 uv run coherent-svm reproduce \
   --config artifact/configs/smoke-synthetic.toml \
@@ -173,9 +176,13 @@ results/<config-id>/<run-id>/
 `-- artifacts.sha256
 ```
 
-Public manifests retain revisions, dependency versions, normalized arguments,
-hardware class, dataset identifiers, and numerical checks. They deliberately
-exclude hostnames, usernames, GPU UUIDs, private remotes, and absolute paths.
+The manifest retains the public source revision and dirty state, configuration
+and library digests, logical dataset identifier, Python version, and platform
+class. Per-process measurements contain the device and compute capability,
+shape, solver parameters, timing, iteration count, support-vector count, and
+sampled accuracy. `checks.json` records completion, fit status, and finite
+timing. These files deliberately exclude hostnames, usernames, GPU UUIDs,
+private remotes, and absolute paths.
 
 ## Numerical claim boundary
 
@@ -183,7 +190,8 @@ The coherent solver reaches its declared low-precision stopping criterion and
 is evaluated through held-out prediction quality. It is not an exact solution
 to the original FP32 RBF objective. The report therefore treats an independent
 FP32 KKT audit as a model-difference diagnostic, not as the convergence
-definition for `coherent_fp16`.
+definition for `coherent_fp16`. The independent audit reported in the PDF is
+not automated by the current public runner.
 
 ## Citation and license
 

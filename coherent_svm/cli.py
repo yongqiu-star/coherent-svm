@@ -55,15 +55,29 @@ def doctor(_: argparse.Namespace) -> int:
         "nvcc": shutil.which("nvcc") is not None,
         "nvidia_smi": shutil.which("nvidia-smi") is not None,
     }
+    cupy_module = None
     for package in ("cupy", "cuml", "numpy", "nvtx"):
         try:
             module = __import__(package)
             checks[package] = getattr(module, "__version__", "available")
+            if package == "cupy":
+                cupy_module = module
         except Exception as error:  # pragma: no cover - environment diagnostic
             checks[package] = f"unavailable: {type(error).__name__}"
+    if cupy_module is not None:
+        try:
+            properties = cupy_module.cuda.runtime.getDeviceProperties(0)
+            major = int(properties["major"])
+            minor = int(properties["minor"])
+            checks["compute_capability"] = f"{major}.{minor}"
+            checks["coherent_solver_sm120"] = major == 12 and minor == 0
+        except Exception as error:  # pragma: no cover - environment diagnostic
+            checks["compute_capability"] = f"unavailable: {type(error).__name__}"
+            checks["coherent_solver_sm120"] = False
     print(json.dumps(checks, indent=2, sort_keys=True))
     unavailable = any(str(value).startswith("unavailable") for value in checks.values())
-    return 0 if checks["nvcc"] and not unavailable else 2
+    solver_supported = checks.get("coherent_solver_sm120") is True
+    return 0 if checks["nvcc"] and not unavailable and solver_supported else 2
 
 
 def method_environment(method: str, cache_columns: int) -> dict[str, str]:
@@ -179,6 +193,10 @@ def reproduce(args: argparse.Namespace) -> int:
     held_out_relative = dataset.get("held_out_relative_path")
     quality_dir = run_dir / ".quality" if held_out_relative else None
 
+    working_set_size = int(config["solver"].get("working_set_size", 1024))
+    if working_set_size != 1024:
+        raise ValueError("the public cuML 26.06 overlay supports working_set_size=1024 only")
+
     methods = list(config["experiment"]["methods"])
     for repeat in range(int(config["experiment"]["repeats"])):
         for method in balanced_order(methods, repeat):
@@ -189,7 +207,9 @@ def reproduce(args: argparse.Namespace) -> int:
                 method_environment(method, int(config["solver"]["cache_columns"]))
             )
             environment["LD_LIBRARY_PATH"] = rapids_library_path(environment)
-            environment["LD_PRELOAD"] = str(args.library.resolve())
+            environment.pop("LD_PRELOAD", None)
+            if method != "stock_fp32":
+                environment["LD_PRELOAD"] = str(args.library.resolve())
             command = [
                 sys.executable,
                 "-m",

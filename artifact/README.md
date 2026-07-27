@@ -34,7 +34,9 @@ Prepared datasets are external to the repository and use this layout:
 
 Both feature arrays are row-major `float32`; labels are `float32` values in
 `{-1,+1}`. The held-out split must be transformed with the training split's
-statistics. Raw EMBER data and derived arrays are not redistributed here.
+statistics. Raw EMBER data and derived arrays are not redistributed here. This
+release specifies the prepared-array contract but does not include EMBER's
+feature-extraction pipeline.
 
 ## Output
 
@@ -42,6 +44,10 @@ Each run contains a normalized manifest, per-process measurements, a summary,
 checks, and checksums. Quality runs also compute prediction disagreements,
 the exact paired McNemar statistic, and score correlation; temporary score
 arrays are removed after aggregation.
+
+The public runner does not automate the independent FP32-objective KKT audit
+reported in the technical report; that audit is a model-difference diagnostic,
+not part of the coherent solver's declared stopping rule.
 
 Absolute paths are accepted as command inputs but are not copied into the
 public manifest. Wall-clock values are observations, not cross-machine pass
