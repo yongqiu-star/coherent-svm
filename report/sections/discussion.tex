@@ -1,0 +1,113 @@
+\section{Discussion and Design Implications}
+
+\subsection{Coherence before precision}
+
+Low precision changes an iterative solver in two ways. It changes arithmetic
+values, and it can change the decisions made from those values. In pair-SMO,
+a small perturbation can select a different pair; that pair changes the next
+gradient, which changes every subsequent selection. Precision is consequently
+not a local property of the GEMM that produces a dot product or of the cache
+that stores an RBF value. It is a property of the induced state-transition
+system.
+
+This explains why converting only the cache can be both smaller and slower.
+If the local solver selects pairs using one representation while the global
+gradient is updated with another, the implementation repeatedly reconciles
+two different operators and may follow a less productive trajectory. Coherent
+FP16 succeeds by making the materializer, cache, and decision-making consumers
+agree on the same rounded kernel. It does not require every scalar control
+operation to use FP16. The transferable rule is therefore
+\emph{coherence before precision}: first define which approximate operator the
+algorithm solves, then choose the precision of each operation while preserving
+that operator at every state-changing boundary.
+
+\subsection{Progress per kernel-data item}
+
+The conventional metrics for a GPU kernel---throughput, occupancy, bytes per
+second, or pair updates per second---do not measure whether an optimization
+solver is moving efficiently toward its target. In this workload, a global
+column $K[X,j]$ may require a full $N\times d$ feature scan, whereas a local
+row $K[W,j]$ is read from an already materialized working-set matrix. Counting
+both as one ``kernel row'' obscures the dominant cost.
+
+A more useful comparison couples the weighted work in
+\cref{eq:cost-model} with optimization progress. For example, over an interval
+$[t,t+r]$, one can report
+\begin{equation}
+  \eta_{\mathrm{kernel}}
+  =
+  \frac{\Phi(\bm{\alpha}^{t})-\Phi(\bm{\alpha}^{t+r})}
+       {M_g C_g(N,d)+R_\ell C_\ell(|W|)},
+  \label{eq:progress-per-kernel-data}
+\end{equation}
+where $\Phi$ is the minimized dual objective and the denominator weights
+global-column generation separately from local-row use. KKT-gap reduction can
+be substituted when objective values are unavailable. This metric exposes a
+common failure mode: a speculative method can execute more GPU work per
+second while obtaining less progress from every generated column.
+
+The resulting design goal is not simply to maximize cache hits or reduce pair
+latency. It is to reuse every expensive, immutable kernel column for enough
+useful local progress to amortize its generation, without over-solving a stale
+working set. This framing applies more broadly to iterative GPU algorithms in
+which expensive data products feed a sequence of state-dependent decisions.
+
+\subsection{Work--depth, not occupancy}
+
+The serial chain in \cref{eq:serial-chain} creates low device utilization, but
+launching more work does not remove the dependence. Large-block methods,
+fixed-depth replay, and speculative prefetch can expose more parallelism while
+also introducing larger Hessians, additional local rows, wasted global
+columns, projection work, or extra outer rounds. Occupancy improves even when
+time to convergence does not.
+
+The relevant abstraction is a work--depth frontier. Here, work includes the
+first two terms of \cref{eq:cost-model}, while depth counts state-changing
+decision stages that cannot overlap. A useful parallel solver must reduce
+depth faster than it increases weighted kernel-data work. The fixed-depth and
+triangular experiments fail this test: they shorten or regularize control but
+leave too much row work unchanged. This is a stronger conclusion than
+``the GPU is underutilized.'' It identifies what a replacement algorithm must
+change: the optimization directions themselves must yield more progress per
+dependent stage.
+
+\subsection{Shape and phase are first-class inputs}
+
+The profitable execution regime is nonuniform in both data shape and solver
+state. At $d=18$ or 28, padding, repeated local-row loads, and solver control
+can dominate because each kernel evaluation contains little arithmetic. At
+$d=2{,}381$, Tensor Core dot products, full-data column misses, cache capacity,
+and the local solver are all material. A representation or tiling strategy
+that is effective in one regime can add overhead in the other.
+
+The same nonuniformity appears over time. In the measured exact trace, late
+outer rounds 100--140 contain residual-limited runs with a local
+5$\times$--7$\times$ depth opportunity, whereas early and middle rounds are
+frequently interrupted by box constraints. This suggests phase-aware solver
+selection, but it does not make adaptation free: each phase-specific primitive
+must first be profitable on its own, and the switching signal must cost less
+than the work it avoids.
+
+Taken together, these results favor dispatch over a universal kernel. Feature
+dimension, working-set size, cache state, active constraints, and recent
+progress should select among mechanisms only when each mechanism has a
+measured region of advantage.
+
+\subsection{Amdahl limits and co-design priorities}
+
+The steady solver phase in \cref{tab:profile} makes the remaining limits
+concrete. Completely deleting the 44.55 ms materializer would provide at most
+approximately 1.27$\times$ speedup. Completely deleting the 84.75 ms block
+solver would provide at most approximately 1.68$\times$. A realistic
+2$\times$ improvement in only one stage yields approximately 1.12$\times$ and
+1.25$\times$, respectively. Thus, no remaining microkernel alone can deliver
+a 2$\times$ end-to-end gain on this workload.
+
+The more promising target is an algorithm--system co-design that changes both
+terms: use a representation that increases reuse and lowers column cost, then
+use a solver that obtains more progress before the next full-data update. Such
+a design should be judged by three questions: how many new global columns it
+generates, how many local rows it consumes, and how much objective or KKT
+progress it obtains before the next dependent decision. These questions turn
+the present negative results into reusable gates for future designs rather
+than implementation-specific anecdotes.

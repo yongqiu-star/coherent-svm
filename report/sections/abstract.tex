@@ -1,0 +1,36 @@
+\begin{abstract}
+Training a nonlinear support vector machine (SVM) at scale is expensive
+because decomposition solvers repeatedly generate kernel columns, update a
+global gradient state, and execute a sequential working-set optimizer. This
+report studies these costs on an NVIDIA RTX PRO 6000 Blackwell GPU using the
+RBF C-SVC implementation in cuML 26.06 as the starting point. We redesign
+kernel generation and reuse, then introduce a \emph{coherent-FP16} execution
+path in which the persistent kernel cache and the local SMO subproblem consume
+the same low-precision kernel representation. On EMBER-65K, coherent FP16
+reduces median fit time from \SI{0.486954}{s} to \SI{0.360385}{s} relative to a
+same-framework, equal-column-capacity direct FP32-cache control, a
+\textbf{1.351$\times$} speedup over seven balanced fresh-process runs (95\%
+bootstrap confidence interval: 1.263$\times$--1.403$\times$). The comparison
+holds logical cache capacity fixed, not cache bytes. On all 200,000 official
+EMBER test samples, a separately matched stock-model comparison changes
+accuracy from 0.830980 to 0.830895 and ROC AUC from 0.93525055 to 0.93516107;
+McNemar's test detects no statistically significant accuracy difference in
+this experiment ($p=0.231645$). The coherent implementation does not satisfy
+the original FP32-kernel KKT audit and must not be described as an exact FP32
+drop-in solver.
+
+After kernel acceleration, the serial SMO block solver becomes the dominant
+GPU kernel, accounting for 40.3\% of the measured steady solver phase. We
+evaluate whole-working-set projected and Newton methods, fixed-depth block-QP
+updates, sampled candidate selection, geometry-aware pair packing,
+stale-candidate prediction, exact-pair replay, triangular batching, and
+speculative overlap. Real working-set captures and a 2,896-step exact GPU
+trace show that these methods either introduce excessive dependent solves,
+consume additional local kernel rows, increase global kernel-column work, or
+retain a substantial serial step-and-update floor. The strongest
+decision-path-aware block-solver micro-optimization provides only a
+1.0376$\times$ paired geometric-mean end-to-end speedup. The resulting design
+boundary is a work-depth constraint: a successful parallel SMO mechanism must
+increase optimization progress per kernel data item while reducing dependent
+stages and outer full-data scans.
+\end{abstract}

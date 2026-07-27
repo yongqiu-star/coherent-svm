@@ -1,0 +1,73 @@
+\section{Evaluation of Positive Mechanisms}
+
+\subsection{Matched coherent-FP16 performance}
+
+\begin{table}[t]
+  \centering
+  \caption{Seven-run EMBER-65K comparison using fresh processes and balanced
+  order. The direct FP32 and coherent-FP16 controls have equal logical
+  cache-column capacity (32,768), not equal cache bytes.}
+  \label{tab:coherent-performance}
+  \begin{tabularx}{\textwidth}{@{}Yrrrr@{}}
+    \toprule
+    Method & Median fit (s) & CV & Outer rounds & Accuracy \\
+    \midrule
+    Direct slotted FP32 cache & 0.486954 & 3.60\% & 152 & 0.957321 \\
+    FP16 cache, FP32 $K[W,W]$ & 0.530813 & 2.60\% & 192 & 0.957153 \\
+    Coherent FP16 & \textbf{0.360385} & 4.05\% & 146 & 0.957123 \\
+    \bottomrule
+  \end{tabularx}
+\end{table}
+
+Coherent FP16 is 1.351$\times$ faster than the direct FP32-cache control, with
+a 95\% bootstrap confidence interval of
+1.263$\times$--1.403$\times$. The incoherent half-cache path is slower despite
+lower storage precision because its outer-round count increases by 26.3\%.
+
+\subsection{Held-out predictive quality}
+
+\begin{table}[t]
+  \centering
+  \caption{Independent FP32 scoring on all 200,000 official EMBER test
+  samples. This comparison uses the saved stock FP32 and coherent-FP16 models;
+  it is not the same baseline pair as \cref{tab:coherent-performance}.}
+  \label{tab:quality}
+  \begin{tabularx}{\textwidth}{@{}Yrrr@{}}
+    \toprule
+    Metric & Stock FP32 & Coherent FP16 & Difference \\
+    \midrule
+    Accuracy & 0.830980 & 0.830895 & $-0.000085$ \\
+    ROC AUC & 0.93525055 & 0.93516107 & $-0.00008948$ \\
+    TPR at 0.1\% FPR & 0.28222 & 0.28084 & $-0.00138$ \\
+    TPR at 1\% FPR & 0.48384 & 0.48316 & $-0.00068$ \\
+    \bottomrule
+  \end{tabularx}
+\end{table}
+
+The models disagree on 179 of 200,000 predictions. Stock is uniquely correct
+on 98 examples and coherent FP16 on 81. The exact McNemar $p$-value is
+0.231645, and decision scores have Pearson correlation 0.9999813. The result
+means that this experiment did not detect a statistically significant
+accuracy difference; it is not an equivalence test with a predeclared margin.
+
+The coherent solver satisfies its own final gap,
+$9.97663\times10^{-4}$, at a tolerance of $10^{-3}$. Under an independently
+reconstructed original FP32 kernel, however, the maximum KKT residual is
+0.058432, with 4,847 samples above $10^{-3}$. A sampled
+1,024-by-1,024 FP16-rounded RBF matrix is mildly indefinite, with minimum
+eigenvalue $-0.00413$. The artifact must not be called an exact FP32
+replacement or a proven convex SVM for a newly defined kernel.
+
+\subsection{Block-solver micro result}
+
+The decision-path-aware micro-optimization accelerates the isolated block
+solver by 1.096$\times$--1.106$\times$. In a provenance-complete,
+direction-balanced 11-pair campaign, median fit time falls from 0.359733 s to
+0.348284 s. The median-ratio speedup is 1.0329$\times$, the paired
+geometric-mean speedup is 1.0376$\times$, and the paired bootstrap 95\%
+interval is 1.0050$\times$--1.0708$\times$. It wins 8 of 11 pairs.
+
+This experiment supports a numerical asymmetry: approximation can be safe for
+broad candidate ranking while remaining unsafe for the committed state
+transition. It is a useful retained optimization, but its magnitude is
+insufficient as a standalone solver contribution.

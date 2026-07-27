@@ -1,0 +1,68 @@
+\section{Introduction}
+
+Nonlinear kernel SVMs expose a form of GPU workload that is easy to
+misdiagnose. Their expensive RBF evaluations resemble dense linear algebra,
+but training is not a sequence of independent matrix multiplications. A
+decomposition solver repeatedly selects a working set, produces or reuses
+kernel data, solves a box-constrained local quadratic program, updates a
+global gradient, and uses the new state to make the next decision. The
+performance of the system is therefore determined jointly by regular numeric
+work and a state-dependent optimization trajectory.
+
+This distinction becomes more important as the regular work is accelerated.
+Tensor Cores make batches of dot products inexpensive, compact kernel values
+increase cache coverage, and fused kernels reduce intermediate traffic. These
+optimizations can expose a different limit: pairwise sequential minimal
+optimization (SMO) commits one update before the next pair can be selected.
+At that point, low occupancy is not itself the problem. It is evidence that
+the algorithm has little independent work to schedule. Increasing occupancy
+by speculating, batching, or replaying updates is useful only if the extra
+work produces enough optimization progress.
+
+We use RBF SVM training to study this interaction between representation,
+data reuse, and dependency depth. Four observations organize the study.
+First, precision is a property of the complete state transition, not of one
+GEMM or cache in isolation: all producers and decision-making consumers of a
+kernel value must observe a coherent representation. Second, global kernel
+columns, local working-set rows, and dependent solver stages have different
+costs and cannot be summarized by FLOP/s or occupancy. Third, the relevant
+unit of efficiency is the optimization progress obtained from each expensive
+piece of kernel data, rather than the number of pair updates executed. Fourth,
+the profitable mechanism changes with feature dimension and training phase,
+so a single static kernel is unlikely to be uniformly optimal.
+
+These observations lead to three research questions.
+
+\begin{itemize}
+  \item \researchq{1}: How do kernel generation, reuse, and local optimization
+        interact to determine end-to-end GPU SVM performance?
+  \item \researchq{2}: Can a coherent low-precision kernel representation
+        improve end-to-end time while retaining measured predictive quality?
+  \item \researchq{3}: When does reducing the dependency depth of pair-SMO
+        improve time to convergence, rather than merely moving work into
+        additional kernel rows, columns, or dense solves?
+\end{itemize}
+
+The study makes four contributions. First, it introduces a cost decomposition
+that separates full-data kernel-column misses, local-row consumption, and
+dependent decision stages. This decomposition explains why superficially
+similar ``kernel scans'' can differ by orders of magnitude. Second, it
+develops coherent-FP16 execution, in which cached kernel values and the local
+solver use the same rounded operator. On EMBER-65K, this design is
+1.351$\times$ faster than a direct-FP32-cache control over seven balanced
+fresh-process runs. Third, it characterizes the resulting bottleneck
+migration: after kernel representation and reuse improve, the dependent local
+solver becomes the largest measured GPU kernel. Fourth, it evaluates several
+ways to shorten that chain and shows why reducing apparent depth is
+insufficient when it increases kernel-data work or outer iterations.
+
+The claims are intentionally bounded. The 1.351$\times$ result is a matched
+comparison on one high-dimensional workload, with equal logical cache
+capacity rather than equal cache bytes. A separate held-out evaluation finds
+no statistically significant accuracy difference between the saved stock
+FP32 and coherent-FP16 models in that experiment, but it does not establish
+cross-workload equivalence. Coherent FP16 also does not satisfy the original
+FP32-kernel KKT audit and is therefore a distinct low-precision optimization
+contract, not an exact FP32 replacement. The solver experiments establish
+boundaries for the measured designs; they do not preclude a parallel SVM
+solver that discovers more productive optimization directions.

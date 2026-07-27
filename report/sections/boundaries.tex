@@ -1,0 +1,136 @@
+\section{Empirical Design-Space Boundaries}
+\label{sec:boundaries}
+
+\subsection{Work-depth objective}
+
+For a local solve, define $D$ as the number of dependent decision/update
+stages and $R_\ell$ as the number of local kernel-row uses. A useful GPU solver
+must reduce $D$ without causing an offsetting increase in $R_\ell$, global
+column misses $M_g$, or outer rounds.
+
+An oracle experiment supplies the exact $(u_t,l_t)$ sequence and removes pair
+selection. The residual exact step and 1,024-element update still require
+1,456.77 cycles per committed step, compared with 3,789.52 cycles for the
+baseline. Perfect pair prediction provides a 2.60$\times$ isolated upper
+bound, but already exceeds the predeclared 1,200-cycle floor before prediction,
+validation, rollback, or contention. Pair selection is expensive, but it is
+not the entire bottleneck.
+
+\subsection{Rejected hypotheses}
+
+\footnotesize
+\begin{longtable}{@{}L{0.21\textwidth}L{0.36\textwidth}L{0.35\textwidth}@{}}
+  \caption{Decision-relevant empirical boundaries for block-solver redesign.}
+  \label{tab:nogo}\\
+  \toprule
+  Hypothesis & Minimal experiment and result & Causal explanation \\
+  \midrule
+  \endfirsthead
+  \multicolumn{3}{l}{\small\itshape Table~\thetable\ continued}\\
+  \toprule
+  Hypothesis & Minimal experiment and result & Causal explanation \\
+  \midrule
+  \endhead
+  \midrule
+  \multicolumn{3}{r}{\small\itshape Continued on the next page}\\
+  \endfoot
+  \bottomrule
+  \endlastfoot
+
+  Whole-working-set projected or Newton solve &
+  Eight real $1{,}024^2$ EMBER subproblems. Retained-set SMO passes 7/8 cases
+  in 11--24 phases but is 6.52$\times$ slower in CUDA. Semismooth Newton passes
+  8/8 but requires 87--164 dense solves; one Newton solve per phase fails early
+  and middle snapshots. &
+  Counting outer phases hides the dependent linear-solve depth. Free sets
+  become large, matrices are ill-conditioned, and small dense solves are not
+  cheap relative to optimized SMO. \\
+
+  Fixed-depth joint block QP &
+  PN1-B8 is correct on 10/10 snapshots. Median conservative depth reduction is
+  1.84$\times$ on SUSY and 2.24$\times$ on EMBER. Integrated CUDA is
+  5.56$\times$--7.15$\times$ slower and reduces outer scans only from 34 to 32. &
+  The eight pairs are still constructed sequentially and each joint update
+  streams up to 16 local rows. Algebraic batching does not reduce row work or
+  outer full-data scans. \\
+
+  Sampled lower-variable selection &
+  Random and sampled-best candidate sets reduce per-step selection work but
+  require more pair and outer updates at the same stopping target. &
+  Candidate quality falls faster than selection cost; a cheaper step is not
+  useful when more steps and kernel data are required. \\
+
+  Scan/update fusion and ratio rewrites &
+  Scan/update fusion preserves snapshot output but runs at
+  0.73--0.78$\times$ baseline speed. Cross-multiplied ratio ranking runs at
+  0.87--0.93$\times$. Fast $q$ changes trajectories and regresses end-to-end
+  time. &
+  Fusion extends the live dependency chain and increases instruction or
+  register pressure. Approximation is unsafe on the committed step even when
+  acceptable for ranking. \\
+
+  Geometry-aware packing and GraphSMO &
+  Offline geometry is promising, but real SUSY replay yields a
+  0.99$\times$ unique-local-endpoint ratio and a 1.00$\times$ net-committed
+  endpoint ratio relative to a strong geometry-block control. &
+  The local path changes, but the set of expensive rows does not shrink.
+  Control-batch reduction alone is insufficient. \\
+
+  Temporal tiling &
+  The best oracle configuration converges in a median 12.5 phases but retains
+  a 0.966 median propagated-column ratio. Local endpoint reuse is only 2.74\%. &
+  Local state is already register-resident, and successive pair updates rarely
+  reuse or cancel endpoints. Deferring propagation groups barriers without
+  removing work. \\
+
+  Stale top-16 SpecSMO &
+  Stale top-16 coverage reaches 84.22\%, but a zero-overhead supplied-$u$
+  oracle has only a 1.226$\times$ optimistic upper bound. &
+  Candidate stability is real, yet lower-variable selection, exact $q$, and
+  the local-state update dominate after $u$ is supplied. \\
+
+  Exact full-pair replay &
+  Across 2,896 bitwise-checked steps, supplying $(u,l)$ reduces cost from
+  3,789.52 to 1,456.77 cycles per step but fails the 1,200-cycle gate. &
+  The residual exact step, two local-row reads, and 1,024-element state update
+  form a substantial serial floor. \\
+
+  Triangular pair batching &
+  The recurrence is numerically valid, but 32.6\% of steps hit box bounds.
+  Chunk 32 achieves only 2.386$\times$ depth reduction and
+  1.005$\times$ local-row byte reduction. &
+  Box clipping terminates the recurrence, and the exact pair stream has almost
+  no endpoint reuse. TRSV changes algebraic form, not trace structure. \\
+
+  Bounded speculative prefetch &
+  Six direction-balanced full-EMBER pairs increase median fit time from
+  4.8746 s to 5.2213 s. The path avoids 6,884 demand misses but generates
+  15,744 speculative global columns. &
+  The current working set is an inaccurate predictor of future cache columns.
+  Apparent overlap is purchased with additional materialization and resource
+  contention. \\
+\end{longtable}
+\normalsize
+
+\subsection{Gate for a future solver}
+
+A new mechanism should proceed to a full CUDA implementation only if one fixed
+configuration satisfies the following conditions on real early-, middle-, and
+late-training subproblems:
+
+\begin{enumerate}
+  \item preserve box and equality feasibility, captured objective progress,
+        and the local stopping contract;
+  \item reduce conservative dependency depth by at least 4$\times$;
+  \item keep net committed local-row endpoints below 1.25$\times$ the pairwise
+        baseline, preferably reducing them;
+  \item generate all joint directions in a bounded number of full-working-set
+        passes rather than hiding serial pair construction inside a block;
+  \item include online direction generation, validation, fallback, and
+        rollback rather than relying on an oracle trace;
+  \item reach at most 1,200 cycles per committed-equivalent update or at least
+        2$\times$ isolated block-solver speedup;
+  \item avoid increasing global-column misses or outer full-data scans; and
+  \item pass direction-balanced, profiler-free end-to-end training under the
+        same numerical contract.
+\end{enumerate}

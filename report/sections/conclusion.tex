@@ -1,0 +1,31 @@
+\section{Conclusion}
+
+This study shows that accelerating nonlinear GPU SVM training requires more
+than a faster RBF kernel. Kernel-column reuse, fused dataflow, and a coherent
+FP16 operator reduce redundant computation and memory traffic, producing a
+1.351$\times$ matched speedup on EMBER-65K. A separate held-out evaluation
+detects no statistically significant accuracy difference in the measured
+experiment. The numerical solution nevertheless differs from the original
+FP32-kernel objective, so the result is a useful low-precision execution
+contract rather than an exact FP32 replacement.
+
+The optimized pipeline reveals a more general systems lesson. Once regular
+numeric work becomes inexpensive, the limiting resource can become dependent
+optimization progress. The local pair-SMO solver does not lack arithmetic
+throughput; each accepted step determines the next decision. Attempts to fill
+the GPU by batching, replaying, or speculating can reduce visible depth while
+increasing global-column generation, local-row consumption, or outer
+iterations. Their success must therefore be measured by progress per weighted
+kernel-data item, not occupancy alone.
+
+Four principles emerge: preserve one coherent approximate operator across all
+state-changing components; distinguish expensive global data production from
+local data reuse; optimize the work--depth frontier rather than either axis in
+isolation; and treat workload shape and solver phase as first-class dispatch
+inputs. These principles are not specific to SVMs. They apply whenever an
+iterative GPU algorithm alternates high-throughput data production with a
+short, state-dependent decision chain. For RBF SVMs, the remaining opportunity
+is a solver that discovers several jointly productive directions from each
+working set, thereby obtaining substantially more convergence progress from
+every generated kernel column without sacrificing the declared numerical
+contract.

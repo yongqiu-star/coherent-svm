@@ -1,0 +1,135 @@
+\documentclass[10pt]{article}
+
+\usepackage[T1]{fontenc}
+\usepackage[utf8]{inputenc}
+\usepackage{newtxtext,newtxmath}
+\usepackage[final]{microtype}
+\usepackage[letterpaper,margin=0.86in,headheight=14pt]{geometry}
+\usepackage{amsmath,bm}
+\usepackage{booktabs,tabularx,longtable,array}
+\usepackage{float}
+\usepackage{enumitem}
+\usepackage{xcolor}
+\usepackage{tikz}
+\usetikzlibrary{arrows.meta,positioning}
+\usepackage{listings}
+\usepackage{xurl}
+\usepackage{hyperref}
+\usepackage[nameinlink,capitalise,noabbrev]{cleveref}
+\usepackage{fancyhdr}
+\usepackage{titlesec}
+\usepackage{caption}
+\usepackage{siunitx}
+
+\definecolor{navy}{HTML}{17365D}
+\definecolor{blue}{HTML}{2E75B6}
+\definecolor{lightblue}{HTML}{EAF2F8}
+\definecolor{darkgray}{HTML}{3F4650}
+\definecolor{lightgray}{HTML}{F3F4F6}
+\definecolor{darkgreen}{HTML}{2F6B4F}
+\definecolor{darkred}{HTML}{9C2F2F}
+
+\hypersetup{
+  colorlinks=true,
+  linkcolor=navy,
+  citecolor=darkgreen,
+  urlcolor=blue,
+  pdftitle={Optimizing RBF SVM Training on Modern GPUs},
+  pdfauthor={Jiang Yongchun},
+  pdfsubject={Technical report on GPU kernel SVM optimization},
+  pdfkeywords={support vector machine, SMO, GPU, CUDA, low precision, kernel cache}
+}
+
+\sisetup{detect-all,group-digits=integer,group-separator={,}}
+\setlist[itemize]{leftmargin=1.45em,itemsep=2pt,topsep=3pt}
+\setlist[enumerate]{leftmargin=1.65em,itemsep=2pt,topsep=3pt}
+\renewcommand{\arraystretch}{1.12}
+
+\newcolumntype{Y}{>{\raggedright\arraybackslash}X}
+\newcolumntype{L}[1]{>{\raggedright\arraybackslash}p{#1}}
+\newcommand{\code}[1]{\texttt{#1}}
+\newcommand{\researchq}[1]{\textbf{RQ#1}}
+
+\pagestyle{fancy}
+\fancyhf{}
+\fancyhead[L]{\small GPU RBF SVM Training}
+\fancyhead[R]{\small Technical Report TR-SVM-2026-07-27}
+\fancyfoot[C]{\thepage}
+\renewcommand{\headrulewidth}{0.35pt}
+
+\titleformat{\section}
+  {\large\bfseries\color{navy}}{\thesection}{0.65em}{}
+\titleformat{\subsection}
+  {\normalsize\bfseries\color{darkgray}}{\thesubsection}{0.6em}{}
+\titleformat{\subsubsection}
+  {\normalsize\bfseries}{\thesubsubsection}{0.55em}{}
+\titlespacing*{\section}{0pt}{1.35em}{0.55em}
+\titlespacing*{\subsection}{0pt}{1.0em}{0.35em}
+
+\captionsetup{font=small,labelfont=bf}
+
+\lstdefinestyle{codeblock}{
+  basicstyle=\ttfamily\small,
+  backgroundcolor=\color{lightgray},
+  frame=single,
+  rulecolor=\color{lightgray},
+  breaklines=true,
+  columns=fullflexible,
+  keepspaces=true,
+  aboveskip=6pt,
+  belowskip=6pt
+}
+
+\begin{document}
+
+\hypersetup{pageanchor=false}
+\begin{titlepage}
+  \centering
+  \vspace*{1.0in}
+  {\Large\bfseries\color{navy}
+    Optimizing RBF SVM Training on Modern GPUs\par}
+  \vspace{0.22in}
+  {\large Coherent Low Precision, Kernel Reuse, and the Limits of Parallel SMO\par}
+  \vspace{0.55in}
+  {\large Jiang Yongchun\par}
+  \vspace{0.12in}
+  {\normalsize Technical Report TR-SVM-2026-07-27\par}
+  \vspace{0.08in}
+  {\normalsize July 27, 2026\par}
+
+  \vfill
+  \begin{minipage}{0.88\textwidth}
+    \small
+    \noindent\textbf{Status.}
+    This mechanism-centered public report studies how representation
+    coherence, kernel-data reuse, and optimization dependency depth interact
+    in GPU RBF SVM training. Measurements are reported with explicit workload
+    and numerical boundaries. Private engineering provenance, superseded
+    experiment logs, and implementation-specific development history are
+    intentionally excluded.
+  \end{minipage}
+  \vspace{0.55in}
+\end{titlepage}
+\hypersetup{pageanchor=true}
+\pagenumbering{roman}
+
+\input{sections/abstract}
+\tableofcontents
+\clearpage
+\pagenumbering{arabic}
+
+\input{sections/introduction}
+\input{sections/background}
+\input{sections/methodology}
+\input{sections/characterization}
+\input{sections/mechanisms}
+\input{sections/evaluation}
+\input{sections/boundaries}
+\input{sections/artifact}
+\input{sections/discussion}
+\input{sections/related_threats}
+\input{sections/conclusion}
+\input{sections/appendices}
+\input{sections/references}
+
+\end{document}

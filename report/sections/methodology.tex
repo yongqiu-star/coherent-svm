@@ -1,0 +1,109 @@
+\section{Experimental Methodology}
+
+\subsection{Platform and software}
+
+\begin{table}[t]
+  \centering
+  \caption{Primary experimental platform.}
+  \label{tab:platform}
+  \begin{tabularx}{\textwidth}{@{}L{0.27\textwidth}Y@{}}
+    \toprule
+    Component & Configuration \\
+    \midrule
+    GPU & NVIDIA RTX PRO 6000 Blackwell Server Edition \\
+    Target architecture & \code{sm\_120a}; driver 590.48.01 \\
+    Build toolkit & CUDA 13.1 \\
+    Profiled runtime & CUDA runtime 13.2 \\
+    Baseline software & cuML 26.06 RBF \code{SVC.fit()} \\
+    Profiling & Nsight Systems 2025.5.2 and Nsight Compute 2025.4.1 \\
+    \bottomrule
+  \end{tabularx}
+\end{table}
+
+Headline timings are profiler-free \code{SVC.fit()} measurements. Nsys is
+used for stage attribution and NCU for selected-kernel mechanism analysis.
+Final comparisons use fresh processes and balanced execution order when
+available.
+
+\subsection{Datasets and preprocessing}
+
+\begin{table}[t]
+  \centering
+  \caption{Principal workloads and their role.}
+  \label{tab:workloads}
+  \begin{tabularx}{\textwidth}{@{}L{0.20\textwidth}L{0.25\textwidth}Y@{}}
+    \toprule
+    Workload & Shape & Purpose \\
+    \midrule
+    EMBER probe & $65{,}536\times2{,}381$ & Repeated high-dimensional timing,
+      profiling, and local-solver capture \\
+    EMBER full & $600{,}000\times2{,}381$ train; 200,000 test & Full-scale
+      cache and low-precision gates \\
+    SUSY & 4.5M train, $d=18$ & Low-dimensional scaling, row-resident reuse,
+      and full KKT certification \\
+    HIGGS & 10.5M train, $d=28$ & Low-dimensional full-scale generalization \\
+    COD-RNA and Skin & Public low-dimensional datasets & External coverage and
+      KKT certificates \\
+    \bottomrule
+  \end{tabularx}
+\end{table}
+
+The EMBER-65K probe is standardized with statistics computed from the probe.
+The 200K held-out evaluation uses the same probe statistics because it
+evaluates models trained on that probe. Full-official EMBER experiments use
+statistics computed from the 600K training set. This difference is intentional
+but limits direct comparison between probe and full-official campaigns.
+
+The primary coherent-FP16 configuration uses $C=1$, $\gamma=1/2381$,
+\code{tol=1e-3}, a 1,024-variable working set, and a cache capacity of 32,768
+logical columns.
+
+\subsection{Baseline and fairness dimensions}
+
+The central performance comparison is between coherent FP16 and a
+same-framework direct FP32-cache control. Both retain 32,768 logical columns;
+the FP32 cache therefore consumes approximately twice the bytes of the FP16
+cache. This design isolates representation and execution effects at equal
+reuse capacity, not equal memory budget.
+
+The public configuration for this comparison is
+\path{artifact/configs/ember65k-ab.toml}. It names the methods
+\code{direct\_fp32} and \code{coherent\_fp16}, the balanced schedule, and the
+logical cache capacity without naming a machine or a particular measurement
+run.
+
+The held-out quality comparison is different: it compares the saved stock
+FP32 model with the coherent-FP16 model under the same independent FP32
+scorer. The performance and quality tables therefore do not share an identical
+comparator. Its public experiment contract is
+\path{artifact/configs/ember65k-quality.toml}, which names
+\code{stock\_fp32} and \code{coherent\_fp16} and a common held-out split.
+
+\subsection{Numerical contracts}
+
+\paragraph{Exact-FP32 contract.}
+The original FP32 RBF kernel defines the objective. Validation checks global
+KKT tolerance, objective, equality feasibility, and box feasibility.
+
+\paragraph{Coherent-low-precision contract.}
+The local $K[W,W]$, global $K[X,W]$, and persistent cache consume a consistent
+low-precision representation. The solver must reach its internal stopping
+criterion and retain held-out predictive quality. It is not required to
+reproduce every FP32 dual variable, but it must not be called an exact solution
+to the original FP32 objective.
+
+\subsection{Measurement and reporting contract}
+
+End-to-end performance uses profiler-free fresh processes, balanced execution
+order, and the complete set of repetitions rather than a selected best run.
+Profiler traces are used only to attribute mechanisms and are not substituted
+for end-to-end timing. Predictive quality is evaluated with a common
+independent scorer, while numerical validation reports the stopping criterion
+of the declared precision contract separately from an FP32-kernel audit.
+
+Every public run emits a normalized artifact bundle. The manifest records the
+configuration and source identities without machine-specific paths; the
+measurement records retain method, shape, device class, solver parameters,
+timing, and stopping diagnostics; and the summary contains paired statistics
+and quality comparisons when requested. These machine-readable files, rather
+than an opaque run name or prose log, are the unit used to compare runs.

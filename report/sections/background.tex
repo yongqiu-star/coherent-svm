@@ -1,0 +1,136 @@
+\section{Background and Problem Formulation}
+
+\subsection{RBF C-SVC dual}
+
+For labels $y_i\in\{-1,+1\}$, the binary C-SVC dual is
+\begin{equation}
+  \min_{\bm{\alpha}}
+  \quad
+  \frac{1}{2}\bm{\alpha}^{\mathsf T}Q\bm{\alpha}
+  -\bm{1}^{\mathsf T}\bm{\alpha},
+  \label{eq:dual}
+\end{equation}
+subject to
+\begin{equation}
+  \bm{y}^{\mathsf T}\bm{\alpha}=0,
+  \qquad
+  0\leq \alpha_i\leq C.
+  \label{eq:dual-constraints}
+\end{equation}
+The matrix entries are
+\begin{equation}
+  Q_{ij}=y_i y_j K(\bm{x}_i,\bm{x}_j),
+  \qquad
+  K(\bm{x}_i,\bm{x}_j)
+  =\exp\!\left(-\gamma\lVert\bm{x}_i-\bm{x}_j\rVert_2^2\right).
+  \label{eq:rbf}
+\end{equation}
+Materializing $Q\in\mathbb{R}^{N\times N}$ is prohibitive at scale.
+Decomposition methods therefore optimize a working set while holding all
+other variables fixed. SMO is the limiting two-variable method and uses an
+analytic box-constrained update~\cite{platt1999smo}; second-order working-set
+selection improves progress per step~\cite{fan2005working}.
+
+\subsection{Execution pipeline}
+
+The measured cuML path follows the five-stage pipeline in
+\cref{fig:pipeline}.
+
+\begin{figure}[t]
+  \centering
+  \begin{tikzpicture}[
+      node distance=4.3mm,
+      box/.style={draw=navy,rounded corners=2pt,fill=lightblue,
+                  minimum width=0.78\textwidth,minimum height=7mm,
+                  align=center,font=\small},
+      hot/.style={draw=darkred,rounded corners=2pt,fill=red!6,
+                  minimum width=0.78\textwidth,minimum height=7mm,
+                  align=center,font=\small},
+      arrow/.style={-{Stealth[length=2mm]},thick,color=darkgray}
+    ]
+    \node[box] (select) {Global working-set selection};
+    \node[box,below=of select] (kww) {Materialize $K[W,W]$};
+    \node[hot,below=of kww] (solve) {Local pair-SMO block solve\\
+      \textbf{40.3\% of the steady solver phase}};
+    \node[box,below=of solve] (global) {Generate or fetch $K[X,W]$ columns and update the global gradient};
+    \node[box,below=of global] (stop) {Check the stopping condition and begin the next outer round};
+    \draw[arrow] (select) -- (kww);
+    \draw[arrow] (kww) -- (solve);
+    \draw[arrow] (solve) -- (global);
+    \draw[arrow] (global) -- (stop);
+    \draw[arrow] (stop.east) -- ++(8mm,0) |- (select.east);
+  \end{tikzpicture}
+  \caption{Execution structure of the measured decomposition solver. The
+  highlighted local solver becomes the dominant GPU kernel after coherent
+  FP16 accelerates RBF materialization and cache traffic.}
+  \label{fig:pipeline}
+\end{figure}
+
+The working-set size is typically 1,024 or 4,096. Two kernel-data units must
+be distinguished:
+
+\begin{itemize}
+  \item a \emph{global column} $K[X,j]$ contains $N$ RBF values and requires
+        scanning the full $N\times d$ feature matrix on a cache miss; and
+  \item a \emph{local row} $K[W,j]$ contains $|W|$ values already present in
+        the local $K[W,W]$ matrix and is consumed by the block solver.
+\end{itemize}
+
+They have different units and costs and must not be added as raw counts.
+
+\subsection{Local working-set QP and serial dependence}
+
+Define the signed working-set displacement
+\begin{equation}
+  s_i=y_i(\alpha_i-\alpha_i^0).
+\end{equation}
+The captured local problem is
+\begin{equation}
+  \min_{\bm{s}}
+  \quad
+  \bm{f}_0^{\mathsf T}\bm{s}
+  +\frac{1}{2}\bm{s}^{\mathsf T}K\bm{s},
+  \label{eq:local-qp}
+\end{equation}
+subject to
+\begin{equation}
+  \bm{1}^{\mathsf T}\bm{s}=0,
+  \qquad
+  \bm{\ell}\leq\bm{s}\leq\bm{u}.
+\end{equation}
+Each pair update selects an upper variable $u_t$ and a lower variable $l_t$,
+computes a feasible step $q_t$, and updates the entire local gradient:
+\begin{equation}
+  \bm{f}^{t+1}
+  =\bm{f}^{t}
+  +q_t\left(K_{u_t,:}-K_{l_t,:}\right).
+  \label{eq:pair-update}
+\end{equation}
+The next pair is selected from $\bm{f}^{t+1}$:
+\begin{equation}
+  (u_t,l_t)\rightarrow q_t\rightarrow \bm{f}^{t+1}
+  \rightarrow (u_{t+1},l_{t+1}).
+  \label{eq:serial-chain}
+\end{equation}
+For a valid positive-semidefinite kernel, this is a convex QP rather than an
+NP-hard problem. The systems challenge is to reduce dependency depth without
+increasing dense-algebra work, local-row consumption, global-column misses, or
+outer rounds.
+
+\subsection{Cost model}
+
+We model the solver cost by three non-interchangeable terms:
+\begin{equation}
+  T \approx
+  M_g\,C_g(N,d)
+  + R_\ell\,C_\ell(|W|)
+  + D\,C_d
+  + T_{\mathrm{misc}},
+  \label{eq:cost-model}
+\end{equation}
+where $M_g$ is the number of global $K[X,j]$ cache misses, $C_g$ is the cost
+of producing one such column, $R_\ell$ is the number of local $K[W,j]$ row
+uses, and $D$ is the number of dependent decision/update stages. A useful
+optimization must reduce at least one term without causing a larger increase
+in another. This model is the basis of the solver gates in
+\cref{sec:boundaries}.

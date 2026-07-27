@@ -1,0 +1,55 @@
+\section{Baseline Characterization and Bottleneck Migration}
+
+\subsection{Kernel-column reuse}
+
+The initial exact-FP32 design targets three redundancies:
+
+\begin{itemize}
+  \item \textbf{storage:} avoid a persistent $N\times m$ dot-product or RBF
+        panel when it is immediately consumed;
+  \item \textbf{transfer:} fuse dot products, the RBF transform, and gradient
+        accumulation to remove staging-to-cache-to-apply round trips; and
+  \item \textbf{computation:} retain immutable global kernel columns in a
+        bounded cache and select caching or streaming according to shape.
+\end{itemize}
+
+The full-EMBER cache-capacity sweep provides a direct mechanism result.
+Increasing the FP32 cache budget from 4 GiB to 56 GiB raises hit rate from
+29.6\% to 56.4\% and reduces median runtime from \SI{18.27}{s} to
+\SI{13.03}{s}. This is an internal capacity effect, not a speedup over
+official cuML.
+
+\subsection{Coherent-FP16 bottleneck profile}
+
+\begin{table}[t]
+  \centering
+  \caption{Nsys breakdown of the \SI{210.27}{ms} steady solver phase for
+  coherent FP16 on EMBER-65K. Fractions are stage evidence, not independent
+  end-to-end costs.}
+  \label{tab:profile}
+  \begin{tabularx}{\textwidth}{@{}Yrr@{}}
+    \toprule
+    Stage & Time (ms) & Fraction \\
+    \midrule
+    \code{SmoBlockSolveCoarsened} & 84.75 & \textbf{40.3\%} \\
+    Full-data FP16 cache-miss materializer & 44.55 & 21.2\% \\
+    Coherent FP16 $K[W,W]$ materializer & 7.41 & 3.5\% \\
+    FP16 cached-column apply & 8.79 & 4.2\% \\
+    Remaining GPU work & 15.87 & 7.5\% \\
+    Launch, synchronization, and host gaps & 48.90 & 23.3\% \\
+    \bottomrule
+  \end{tabularx}
+\end{table}
+
+NCU shows that the block solver launches one 256-thread CTA and reaches only
+0.11\% whole-device SM throughput and 0.17\% DRAM throughput. PC sampling is
+dominated by wait, scoreboard, and barrier stalls. This does not prove that a
+parallel replacement will be faster. It identifies a dependency-limited
+kernel rather than an FP16 throughput bottleneck.
+
+The full-data materializer has two regimes. Large panels achieve higher
+compute throughput, whereas small panels scan the full feature matrix and are
+predominantly DRAM-bound. The implementation dispatches 32,000 padded columns
+for 20,114 useful new columns. Removing padding is useful, but a full-$X$ scan
+sets a floor that prevents a linear conversion of padded work into wall-time
+savings.

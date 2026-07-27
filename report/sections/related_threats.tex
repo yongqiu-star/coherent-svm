@@ -1,0 +1,65 @@
+\section{Related Work}
+
+SMO reduces an SVM dual problem to analytically solvable two-variable updates
+\cite{platt1999smo}. Second-order working-set selection, as used by LIBSVM and
+related decomposition solvers, trades additional candidate scoring for fewer
+optimization steps~\cite{fan2005working,chang2011libsvm}. This tradeoff is
+directly visible in our sampled-candidate experiments: cheaper selection
+increases the number of committed updates.
+
+GPU SVM systems have long accelerated kernel evaluation and solver updates.
+Catanzaro et al.\ demonstrated early GPU-oriented training and classification
+\cite{catanzaro2008gpu}, while ThunderSVM provides a later GPU/CPU SVM
+implementation with an optimized working-set pipeline~\cite{wenthundersvm}.
+The current study differs in emphasis. It begins from cuML's production RBF
+solver, separates global column generation from local-row consumption, and
+uses exact GPU traces to measure the residual work after pair selection is
+removed.
+
+Block decomposition, active-set, and Newton methods are established approaches
+to convex QP optimization. Our contribution is not a new general convergence
+theory. It is an empirical systems boundary on the captured GPU subproblems:
+free sets become large, dense solves remain dependent, and algebraic batching
+does not reduce enough kernel-row work to beat an optimized pair-SMO kernel.
+
+\section{Threats to Validity and Limitations}
+
+\paragraph{Workload coverage.}
+The decision-grade coherent-FP16 result is concentrated on EMBER-65K with one
+hyperparameter setting. SUSY and HIGGS provide shape diversity, but their
+largest speedups are historical screening evidence rather than matched
+official-baseline results.
+
+\paragraph{Fairness dimensions.}
+The 1.351$\times$ comparison fixes logical cache capacity, not bytes. This is
+appropriate for studying representation and reuse but gives FP16 a smaller
+memory footprint. The 2.371$\times$ stock comparison is explicitly contextual
+because cache budgets differ substantially.
+
+\paragraph{Quality inference.}
+A non-significant McNemar result is not proof of equivalence. No equivalence
+margin was predeclared, and cross-dataset quality is not established. The
+reported AUC and tail metrics also change slightly.
+
+\paragraph{Numerical objective.}
+Coherent FP16 passes its internal stopping criterion but not the original
+FP32-kernel KKT audit. A sampled rounded RBF matrix is mildly indefinite.
+Claims are therefore limited to measured predictive quality and the declared
+low-precision execution contract.
+
+\paragraph{Preprocessing.}
+The EMBER probe and full-official campaigns use different training statistics.
+The 200K test set is standardized with probe statistics only when evaluating
+probe-trained models.
+
+\paragraph{Profiling and capture.}
+Nsys and NCU perturb timing and are used only for attribution. One early
+real-working-set capture lacked a complete source-to-binary chain; later clean
+GPU traces validate final alpha and delta behavior. A publication artifact
+should nevertheless recapture every central snapshot from one released tree.
+
+\paragraph{Hardware scope.}
+The primary target is one RTX PRO 6000 Blackwell GPU. The conclusions may
+change with memory capacity, Tensor Core ratios, or launch characteristics on
+other architectures. Multi-GPU experiments did not establish a stable
+convergence contract and are excluded from the main analysis.

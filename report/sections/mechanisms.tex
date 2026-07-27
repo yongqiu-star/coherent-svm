@@ -1,0 +1,69 @@
+\section{Dataflow and Precision Mechanisms}
+
+\subsection{Coherent FP16}
+
+A naive half-cache path stores RBF values in FP16 while constructing the local
+$K[W,W]$ in FP32. The optimizer then consumes two inconsistent versions of
+the same kernel. On EMBER-65K, this design requires 192 outer rounds, compared
+with 152 for the direct FP32-cache control.
+
+The coherent-FP16 path instead enforces the following execution invariant:
+all decision-relevant local and global kernel values derive from the same
+quantized inputs and distance rules. The implementation uses half precision
+for training features or persistent RBF values, Tensor Cores for
+high-dimensional dot-product tiles, and FP32 for the RBF transform,
+accumulation, dual variables, gradients, and SMO control. It also avoids a
+large FP32 staging panel.
+
+With coherent values, outer rounds fall to 146. The mechanism is therefore not
+simply that FP16 arithmetic is faster. A stateful optimizer must see one
+coherent approximate operator at every point where it makes decisions.
+
+\subsection{Shape-aware low-dimensional reuse}
+
+The general high-dimensional TMA path pads SUSY from $d=18$ to $d=64$. The
+compact path stores the original 18 features, uses aligned \code{half2} loads,
+keeps two adjacent training rows per thread, stages 32 working-set rows at a
+time, and accumulates RBF and gradient updates in FP32.
+
+Relative to the strongest reuse-aware FP32 baseline, compact coherent FP16
+improves SUSY-65K by 1.0995$\times$ and SUSY-1M by 1.0958$\times$. The generic
+padded path is approximately neutral or slower. Low- and high-dimensional
+workloads therefore require different kernels: Tensor Core dot products are
+valuable in high dimensions, while eliminating padding and repeated row loads
+matters more in low dimensions.
+
+\subsection{Decision-path-aware block-solver micro-optimization}
+
+The local solver repeatedly scans candidates, ranks lower variables, computes
+an accepted step, and identifies threads that own selected variables. The
+accepted micro-optimization uses approximate division only for broad
+candidate ranking, retains exact FP32 arithmetic for the committed step $q$,
+and replaces an all-thread owner search with direct index mapping.
+
+Across eight captured snapshots, the candidate reproduces the captured
+trajectory. In the formal end-to-end run, however, iteration counts differ
+slightly (46,854 versus 46,861) and one of 65,536 training predictions differs.
+The defensible description is therefore \emph{snapshot-equivalent and
+quality-equivalent under the coherent-FP16 contract}, not globally
+bitwise-exact.
+
+\subsection{Lower precision beyond FP16}
+
+Lower bit widths do not automatically extend the FP16 result.
+
+\begin{itemize}
+  \item An MXFP8-compute path with an FP16 cache retains much of the measured
+        quality but does not establish a uniformly stronger mechanism.
+  \item A linear U8 RBF cache doubles cache-column capacity and reduces one
+        full-EMBER fit from \SI{4.865}{s} to \SI{3.734}{s}
+        (1.303$\times$), but test accuracy falls from 0.92648 to 0.75329.
+  \item An NVFP4 reconstructed-input gate reaches the internal tolerance and
+        changes EMBER-65K training accuracy by $-3.05\times10^{-5}$. Its
+        fit-time ratio is approximately 1.007$\times$ and preprocessing is
+        excluded; the SVM kernel is not executed natively in FP4.
+\end{itemize}
+
+Feature quantization, RBF exponentiation, cache encoding, local
+materialization, and solver state must form one coherent data path. Peak FP8
+or FP4 GEMM throughput alone is not an end-to-end argument.

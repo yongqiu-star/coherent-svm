@@ -1,0 +1,141 @@
+\appendix
+
+\section{Claim-to-Public-Artifact Matrix}
+\label{app:public-configs}
+
+\begin{table}[H]
+  \centering
+  \caption{Public files associated with the report's central claims.}
+  \begin{tabularx}{\textwidth}{@{}L{0.22\textwidth}L{0.30\textwidth}Y@{}}
+    \toprule
+    Purpose & Public artifact & Reproducibility boundary \\
+    \midrule
+    Portable numerical correctness &
+      \path{tests/test_portable_backend_gpu.py} and
+      \path{smoke-synthetic.toml} &
+      Compares FP32 and FP16 cache materialization and the full
+      $K\Delta\alpha$ update with an explicit RBF oracle; also exercises the
+      patched solver end to end. \\
+    Matched performance protocol &
+      \path{ember65k-ab.toml} and
+      \path{reference/pro6000.json} &
+      Encodes equal logical cache capacity and balanced repetitions. The
+      public portable backend does not reproduce the 1.351$\times$
+      architecture-tuned result. \\
+    Held-out quality protocol &
+      \path{ember65k-quality.toml} &
+      Runs stock FP32 and coherent FP16 on one held-out split and summarizes
+      accuracy, AUC, disagreements, McNemar's exact test, and score
+      correlation. It is not an equivalence proof. \\
+    Work--depth analysis &
+      \path{studies/work-depth/metrics.py} &
+      Separates global columns, local rows, and dependent decision stages.
+      The private captured traces used in the report are not redistributed. \\
+    \bottomrule
+  \end{tabularx}
+\end{table}
+
+The source release is intentionally smaller than the development workspace.
+Generated datasets, binaries, profiler reports, and failed experimental
+branches are not required to understand or exercise the mechanism.
+
+\section{Repository Layout and Quick Start}
+\label{app:quick-start}
+
+The fresh public repository has the following stable surface:
+
+\begin{lstlisting}[style=codeblock]
+coherent-svm/
+|-- src/portable_fp16_rbf_backend.cu
+|-- include/
+|-- patches/cuml-26.06.00/
+|-- coherent_svm/
+|-- artifact/configs/
+|-- artifact/schemas/
+|-- studies/work-depth/
+`-- tests/
+\end{lstlisting}
+
+The repository is public; only dependency paths remain machine-specific:
+
+\begin{lstlisting}[style=codeblock]
+git clone https://github.com/yongqiu-star/coherent-svm
+cd coherent-svm
+uv sync --frozen --extra gpu --extra quality --extra dev
+uv run coherent-svm doctor
+
+export CUML_SOURCE=<path-to-cuml-26.06.00>
+export CUVS_INCLUDE=<path-to-cuvs-include>
+git -C "$CUML_SOURCE" apply \
+  "$PWD/patches/cuml-26.06.00/coherent-fp16.patch"
+CUML_SOURCE="$CUML_SOURCE" CUVS_INCLUDE="$CUVS_INCLUDE" \
+  scripts/build.sh
+
+COHERENT_SVM_LIBRARY=build/libcoherent_svm.so \
+  uv run pytest -q
+uv run coherent-svm reproduce \
+  --config artifact/configs/smoke-synthetic.toml \
+  --library build/libcoherent_svm.so \
+  --output-root results
+\end{lstlisting}
+
+The main prepared-data protocol replaces the smoke configuration with
+\path{artifact/configs/ember65k-ab.toml} and adds
+\code{--data-root <prepared-data-root>}. Dataset arrays remain external to the
+repository; their normalized layout is documented in
+\path{artifact/README.md}.
+
+\section{Normalized Output Contract}
+\label{app:output-contract}
+
+Each reproduction writes five public files:
+
+\begin{lstlisting}[style=codeblock]
+results/<config-id>/<run-id>/
+|-- manifest.json
+|-- measurements.jsonl
+|-- summary.json
+|-- checks.json
+`-- artifacts.sha256
+\end{lstlisting}
+
+The manifest retains the public source revision, dirty state, configuration
+and library digests, logical dataset identifier, Python version, and platform
+class. It intentionally omits the hostname, user name, GPU UUID, private Git
+remote, and absolute command paths. Shape, device model, compute capability,
+solver parameters, timing, iteration count, and sampled training accuracy are
+written with each measurement rather than hidden in a prose log.
+
+For example, the balanced performance summary has the following stable
+shape; absolute times are observations rather than cross-machine pass
+conditions:
+
+\begin{lstlisting}[style=codeblock]
+{
+  "config_id": "ember65k-ab",
+  "baseline": {"method": "direct_fp32",
+               "median_fit_seconds": "<measured>"},
+  "candidate": {"method": "coherent_fp16",
+                "median_fit_seconds": "<measured>"},
+  "speedup": "<ratio>",
+  "speedup_ci95": ["<low>", "<high>"],
+  "repeats": 7
+}
+\end{lstlisting}
+
+\section{Licensing and Redistribution Boundary}
+\label{app:licensing}
+
+The original reference backend, runner, configurations, schemas, tests, and
+documentation are released under Apache-2.0. Changes to cuML are distributed
+as patches against cuML 26.06.00 and retain the upstream license notices when
+applied. CUDA, cuBLAS, cuML, RAPIDS dependencies, and datasets are external;
+the repository neither vendors their binaries nor redistributes raw data.
+
+The optimized \code{sm\_120a} backend is excluded because file-level
+provenance and redistribution rights for all third-party-derived components
+have not yet been resolved. This is a release boundary, not a performance
+claim: the portable backend validates the coherent operator and integration,
+whereas the 1.351$\times$ measurement describes the unreleased tuned backend.
+A later release of that backend requires an independent provenance and
+licensing review.
