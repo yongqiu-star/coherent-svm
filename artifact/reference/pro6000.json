@@ -1,0 +1,21 @@
+{
+  "config_id": "ember65k-ab",
+  "hardware": "NVIDIA RTX PRO 6000 Blackwell Server Edition",
+  "backend": "architecture-tuned-sm120-not-in-public-snapshot",
+  "baseline": {
+    "method": "direct_fp32",
+    "median_fit_seconds": 0.486954
+  },
+  "candidate": {
+    "method": "coherent_fp16",
+    "median_fit_seconds": 0.360385
+  },
+  "speedup": 1.351,
+  "speedup_ci95": [1.263, 1.403],
+  "outer_rounds": {
+    "baseline": 152,
+    "candidate": 146
+  },
+  "boundary": "Reference signal only; the public portable backend is a semantic comparator."
+}
+

@@ -1,0 +1,16 @@
+Coherent SVM research artifact
+Copyright 2026 Jiang Yongchun
+
+This distribution contains modifications to NVIDIA RAPIDS cuML 26.06.00.
+cuML is licensed under the Apache License 2.0. Modified upstream files are
+distributed as patches and retain their upstream notices when applied.
+
+The public reference backend uses NVIDIA CUDA and cuBLAS APIs but does not
+redistribute NVIDIA binaries, RAPIDS binaries, or datasets.
+
+The architecture-tuned SM120 backend used for the timing results in the
+accompanying technical report is intentionally excluded from this source
+snapshot while third-party provenance is being resolved. The included
+portable backend reproduces the coherent numerical protocol, not the reported
+SM120 performance.
+

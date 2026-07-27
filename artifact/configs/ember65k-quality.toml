@@ -1,0 +1,28 @@
+id = "ember65k-quality"
+
+[dataset]
+id = "ember2018-quality200k"
+kind = "prepared"
+relative_path = "ember2018/probe-65536"
+rows = 65536
+dim = 2381
+held_out_relative_path = "ember2018/test-200000"
+held_out_rows = 200000
+
+[experiment]
+methods = ["stock_fp32", "coherent_fp16"]
+repeats = 1
+schedule = "balanced"
+
+[solver]
+c = 1.0
+tol = 1e-3
+max_iter = 60000
+working_set_size = 1024
+cache_columns = 32768
+cache_size_mib = 1024
+
+[evaluation]
+rows = 65536
+held_out_dataset = "ember2018-test200k"
+metrics = ["accuracy", "roc_auc", "mcnemar", "score_correlation", "fp32_kkt_audit"]

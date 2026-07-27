@@ -1,0 +1,11 @@
+cff-version: 1.2.0
+message: "If you use this artifact, please cite the accompanying technical report."
+title: "Coherent SVM: Coherent Low-Precision RBF SVM Training"
+type: software
+authors:
+  - family-names: Jiang
+    given-names: Yongchun
+version: 0.1.0
+date-released: 2026-07-27
+license: Apache-2.0
+

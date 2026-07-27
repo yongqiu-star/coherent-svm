@@ -1,0 +1,30 @@
+[build-system]
+requires = ["hatchling>=1.27"]
+build-backend = "hatchling.build"
+
+[project]
+name = "coherent-svm-artifact"
+version = "0.1.0"
+description = "Public research artifact for coherent low-precision RBF SVM training"
+readme = "README.md"
+requires-python = ">=3.11"
+license = {file = "LICENSE"}
+authors = [{name = "Jiang Yongchun"}]
+dependencies = ["numpy>=2.0", "nvtx>=0.2"]
+
+[project.optional-dependencies]
+gpu = ["cupy-cuda13x>=14", "cuml-cu13==26.6.*"]
+quality = ["scikit-learn>=1.6", "scipy>=1.14"]
+dev = ["pytest>=8.0", "ruff>=0.11"]
+
+[project.scripts]
+coherent-svm = "coherent_svm.cli:main"
+
+[tool.hatch.build.targets.wheel]
+packages = ["coherent_svm"]
+
+[tool.ruff]
+line-length = 96
+
+[tool.pytest.ini_options]
+markers = ["gpu: requires an NVIDIA GPU and a built coherent_svm overlay"]

@@ -1,0 +1,23 @@
+id = "smoke-synthetic"
+
+[dataset]
+id = "synthetic-rbf-smoke"
+kind = "synthetic"
+rows = 65536
+dim = 256
+
+[experiment]
+methods = ["direct_fp32", "coherent_fp16"]
+repeats = 1
+schedule = "balanced"
+
+[solver]
+c = 1.0
+tol = 1e-3
+max_iter = 512
+working_set_size = 1024
+cache_columns = 2048
+cache_size_mib = 1024
+
+[evaluation]
+rows = 1024

@@ -1,0 +1,1870 @@
+diff --git a/cpp/src/svm/kernelcache.cuh b/cpp/src/svm/kernelcache.cuh
+index 86f6873..95a5e30 100644
+--- a/cpp/src/svm/kernelcache.cuh
++++ b/cpp/src/svm/kernelcache.cuh
+@@ -11,6 +11,7 @@
+ #include <cuml/svm/svm_parameter.h>
+ 
+ #include <raft/core/handle.hpp>
++#include <raft/core/nvtx.hpp>
+ #include <raft/linalg/gemm.cuh>
+ #include <raft/linalg/init.cuh>
+ #include <raft/linalg/norm.cuh>
+@@ -484,6 +485,7 @@ class KernelCache {
+    */
+   void InitWorkingSet(const int* ws_idx)
+   {
++    raft::common::nvtx::range<> stage{"KernelCache::prepare_working_set"};
+     ASSERT(cache_state != CacheState::WS_INITIALIZED, "Working set has already been initialized!");
+     ASSERT(cache_state != CacheState::BATCHING_INITIALIZED, "Previous batching step incomplete!");
+     this->ws_idx = ws_idx;
+@@ -548,6 +550,7 @@ class KernelCache {
+    */
+   math_t* getSquareTileWithoutCaching()
+   {
++    raft::common::nvtx::range<> stage{"KernelCache::working_set_kernel"};
+     ASSERT(cache_state != CacheState::READY, "Working set not initialized!");
+     ASSERT(cache_state != CacheState::BATCHING_INITIALIZED, "Previous batching step incomplete!");
+ 
+@@ -597,6 +600,20 @@ class KernelCache {
+     return kernel_tile.data();
+   }
+ 
++  /**
++   * @brief Return the square-tile storage without evaluating the stock kernel.
++   *
++   * Experimental hook for a drop-in working-set kernel evaluator. The caller
++   * must overwrite all n_ws*n_ws entries on the same stream before use.
++   */
++  math_t* getSquareTileStorageWithoutCompute()
++  {
++    ASSERT(cache_state != CacheState::READY, "Working set not initialized!");
++    ASSERT(cache_state != CacheState::BATCHING_INITIALIZED,
++           "Previous batching step incomplete!");
++    return kernel_tile.data();
++  }
++
+   /**
+    * @brief Initialize the (batched) kernel retrieval for full rows
+    *
+@@ -612,6 +629,7 @@ class KernelCache {
+     ASSERT(cache_state != CacheState::BATCHING_INITIALIZED, "Previous batching step incomplete!");
+     int n_cached = 0;
+     if (batch_cache.GetSize() > 0) {
++      raft::common::nvtx::range<> stage{"KernelCache::batch_cache_lookup"};
+       // we only do this once per workingset for
+       batch_cache.GetCacheIdxPartitionedStable(
+         nz_da_idx, nnz_da, ws_cache_idx.data() + n_ws, &n_cached, stream);
+@@ -621,6 +639,7 @@ class KernelCache {
+ 
+     int n_uncached = nnz_da - n_cached;
+     if (n_uncached > 0) {
++      raft::common::nvtx::range<> stage{"KernelCache::batch_miss_prepare"};
+       if (sparse_extract) {
+         ML::SVM::extractRows<math_t>(matrix, *x_ws_csr, nz_da_idx + n_cached, n_uncached, handle);
+       } else {
+@@ -691,6 +710,7 @@ class KernelCache {
+ 
+     // fill in n_cached ids from cache
+     if (n_cached > 0) {
++      raft::common::nvtx::range<> stage{"KernelCache::batch_cache_read"};
+       batch_cache.GetVecs(
+         batch_id, batch_size, ws_cache_idx.data(), n_cached, kernel_tile.data(), stream);
+     }
+@@ -699,56 +719,64 @@ class KernelCache {
+       int* ws_idx_new  = batch_descriptor.nz_da_idx + n_cached;
+       math_t* tile_new = kernel_tile.data() + (size_t)n_cached * batch_size;
+ 
+-      if (is_precomputed) {
+-        // For precomputed kernels, extract K[offset:offset+batch_size, ws_idx_new]
+-        // Input matrix is column-major: K[row, col] = K[row + col * n_rows]
+-        // Output tile_new is column-major: tile_new[i, j] = tile_new[i + j * batch_size]
+-        if constexpr (isDenseType<MatrixViewType>()) {
+-          const math_t* matrix_data = getDenseData(matrix);
+-          thrust::counting_iterator<int> iter(0);
+-          int n_elems     = batch_size * n_uncached;
+-          int matrix_rows = n_rows;  // Copy member to local for lambda capture
+-          thrust::transform(
+-            thrust::cuda::par.on(stream),
+-            iter,
+-            iter + n_elems,
+-            tile_new,
+-            [matrix_data, ws_idx_new, matrix_rows, offset, batch_size] __device__(int tid) {
+-              // Column-major output: tile_new[row, col] = tile_new[row + col * batch_size]
+-              int row     = tid % batch_size;
+-              int col     = tid / batch_size;
+-              int src_row = offset + row;
+-              int src_col = ws_idx_new[col];
+-              // Column-major input: K[row, col] = K[row + col * matrix_rows]
+-              return matrix_data[src_row + src_col * matrix_rows];
+-            });
+-        }
+-      } else {
+-        auto batch_matrix = getMatrixBatch(
+-          matrix, batch_size, offset, host_indptr.data(), indptr_batched.data(), stream);
+-
+-        // compute kernel
+-        math_t* norm_with_offset =
+-          matrix_l2.data() != nullptr ? matrix_l2.data() + offset : nullptr;
+-        if (sparse_extract) {
+-          auto ws_view = getViewWithFixedDimension(*x_ws_csr, n_uncached, n_cols);
+-          KernelOp(
+-            handle, kernel, batch_matrix, ws_view, tile_new, norm_with_offset, matrix_l2_ws.data());
++      {
++        raft::common::nvtx::range<> stage{"KernelCache::batch_kernel_generate"};
++        if (is_precomputed) {
++          // For precomputed kernels, extract K[offset:offset+batch_size, ws_idx_new]
++          // Input matrix is column-major: K[row, col] = K[row + col * n_rows]
++          // Output tile_new is column-major: tile_new[i, j] = tile_new[i + j * batch_size]
++          if constexpr (isDenseType<MatrixViewType>()) {
++            const math_t* matrix_data = getDenseData(matrix);
++            thrust::counting_iterator<int> iter(0);
++            int n_elems     = batch_size * n_uncached;
++            int matrix_rows = n_rows;  // Copy member to local for lambda capture
++            thrust::transform(
++              thrust::cuda::par.on(stream),
++              iter,
++              iter + n_elems,
++              tile_new,
++              [matrix_data, ws_idx_new, matrix_rows, offset, batch_size] __device__(int tid) {
++                // Column-major output: tile_new[row, col] = tile_new[row + col * batch_size]
++                int row     = tid % batch_size;
++                int col     = tid / batch_size;
++                int src_row = offset + row;
++                int src_col = ws_idx_new[col];
++                // Column-major input: K[row, col] = K[row + col * matrix_rows]
++                return matrix_data[src_row + src_col * matrix_rows];
++              });
++          }
+         } else {
+-          KernelOp(handle,
+-                   kernel,
+-                   batch_matrix,
+-                   x_ws_dense.data(),
+-                   n_uncached,
+-                   tile_new,
+-                   norm_with_offset,
+-                   matrix_l2_ws.data());
++          auto batch_matrix = getMatrixBatch(
++            matrix, batch_size, offset, host_indptr.data(), indptr_batched.data(), stream);
++
++          // compute kernel
++          math_t* norm_with_offset =
++            matrix_l2.data() != nullptr ? matrix_l2.data() + offset : nullptr;
++          if (sparse_extract) {
++            auto ws_view = getViewWithFixedDimension(*x_ws_csr, n_uncached, n_cols);
++            KernelOp(handle,
++                     kernel,
++                     batch_matrix,
++                     ws_view,
++                     tile_new,
++                     norm_with_offset,
++                     matrix_l2_ws.data());
++          } else {
++            KernelOp(handle,
++                     kernel,
++                     batch_matrix,
++                     x_ws_dense.data(),
++                     n_uncached,
++                     tile_new,
++                     norm_with_offset,
++                     matrix_l2_ws.data());
++          }
+         }
++        RAFT_CUDA_TRY(cudaPeekAtLastError());
+       }
+ 
+-      RAFT_CUDA_TRY(cudaPeekAtLastError());
+-
+       if (batch_cache.GetSize() > 0 && n_uncached > 0) {
++        raft::common::nvtx::range<> stage{"KernelCache::batch_cache_store"};
+         // AssignCacheIdx should not permute ws_idx_new anymore as we have sorted
+         // it already during InitWorkingSet
+         batch_cache.AssignAndStoreVecs(batch_id,
+@@ -769,6 +797,14 @@ class KernelCache {
+     return true;
+   }
+ 
++  /** Mark a working set complete when an external fused update bypasses batching. */
++  void FinishWorkingSetWithoutBatching()
++  {
++    ASSERT(cache_state == CacheState::WS_INITIALIZED,
++           "Fused completion requires an initialized working set!");
++    cache_state = CacheState::READY;
++  }
++
+   /** @brief Select a subset of values
+    *
+    * Select a subset of values
+diff --git a/cpp/src/svm/smoblocksolve.cuh b/cpp/src/svm/smoblocksolve.cuh
+index 6d05c88..01b8946 100644
+--- a/cpp/src/svm/smoblocksolve.cuh
++++ b/cpp/src/svm/smoblocksolve.cuh
+@@ -270,5 +270,169 @@ CUML_KERNEL __launch_bounds__(WSIZE) void SmoBlockSolve(math_t* y_array,
+   // f is recalculated in f_update, therefore we do not need to save that
+   return_buff[1] = n_iter;
+ }
++
++/** Exact thread-coarsened SMO with the same pair-update order as SmoBlockSolve. */
++template <typename math_t, int TPB, int ITEMS_PER_THREAD>
++CUML_KERNEL __launch_bounds__(TPB) void SmoBlockSolveCoarsened(math_t* y_array,
++                                                               int n_train,
++                                                               math_t* alpha,
++                                                               int n_ws,
++                                                               math_t* delta_alpha,
++                                                               math_t* f_array,
++                                                               const math_t* kernel,
++                                                               const int* ws_idx,
++                                                               const math_t* C_vec,
++                                                               math_t eps,
++                                                               math_t* return_buff,
++                                                               int max_iter = 10000,
++                                                               SvmType svmType = C_SVC)
++{
++  static_assert(TPB * ITEMS_PER_THREAD == 1024,
++                "coarsened variants target the 1024-entry SMO working set");
++  using Pair             = MLCommon::Selection::KVPair<math_t, int>;
++  using BlockReducePair  = cub::BlockReduce<Pair, TPB>;
++  using BlockReduceFloat = cub::BlockReduce<math_t, TPB>;
++  __shared__ union {
++    typename BlockReducePair::TempStorage pair;
++    typename BlockReduceFloat::TempStorage single;
++  } temp_storage;
++
++  constexpr math_t ETA_EPS = 1.0e-12;
++  __shared__ math_t f_u;
++  __shared__ math_t diff;
++  __shared__ math_t diff_end;
++  __shared__ math_t tmp_u;
++  __shared__ math_t tmp_l;
++  __shared__ int u;
++  __shared__ int l;
++  __shared__ math_t Kd[TPB * ITEMS_PER_THREAD];
++
++  const int tid = threadIdx.x;
++  math_t local_y[ITEMS_PER_THREAD];
++  math_t local_f[ITEMS_PER_THREAD];
++  math_t local_a[ITEMS_PER_THREAD];
++  math_t local_a_save[ITEMS_PER_THREAD];
++  math_t local_C[ITEMS_PER_THREAD];
++  math_t local_Kui[ITEMS_PER_THREAD];
++
++#pragma unroll
++  for (int item = 0; item < ITEMS_PER_THREAD; ++item) {
++    const int pos = tid + item * TPB;
++    if (pos < n_ws) {
++      const int idx      = ws_idx[pos];
++      local_y[item]      = y_array[idx];
++      local_f[item]      = f_array[idx];
++      local_a[item]      = alpha[idx];
++      local_a_save[item] = local_a[item];
++      local_C[item]      = C_vec[idx];
++      Kd[pos]            = kernel[static_cast<size_t>(pos) * n_ws + pos];
++    } else {
++      local_y[item]      = math_t{0};
++      local_f[item]      = math_t{0};
++      local_a[item]      = math_t{0};
++      local_a_save[item] = math_t{0};
++      local_C[item]      = math_t{0};
++      Kd[pos]            = math_t{0};
++    }
++  }
++  __syncthreads();
++
++  int n_iter = 0;
++  for (; n_iter < max_iter; ++n_iter) {
++    Pair upper_best{INFINITY, -1};
++#pragma unroll
++    for (int item = 0; item < ITEMS_PER_THREAD; ++item) {
++      const int pos = tid + item * TPB;
++      if (pos < n_ws && in_upper(local_a[item], local_y[item], local_C[item]) &&
++          local_f[item] < upper_best.val) {
++        upper_best = Pair{local_f[item], pos};
++      }
++    }
++    Pair result = BlockReducePair(temp_storage.pair).Reduce(upper_best, cuda::minimum{});
++    if (tid == 0) {
++      f_u = result.val;
++      u   = result.key;
++    }
++    __syncthreads();
++
++    math_t lower_max = -INFINITY;
++#pragma unroll
++    for (int item = 0; item < ITEMS_PER_THREAD; ++item) {
++      const int pos = tid + item * TPB;
++      if (pos < n_ws) {
++        local_Kui[item] = kernel[static_cast<size_t>(u) * n_ws + pos];
++        if (in_lower(local_a[item], local_y[item], local_C[item])) {
++          lower_max = max(lower_max, local_f[item]);
++        }
++      }
++    }
++    const math_t f_max = BlockReduceFloat(temp_storage.single).Reduce(lower_max, cuda::maximum{});
++    if (tid == 0) {
++      diff = f_max - f_u;
++      if (n_iter == 0) {
++        return_buff[0] = diff;
++        diff_end       = max(eps, math_t{0.1} * diff);
++      }
++    }
++    __syncthreads();
++    if (diff < diff_end) { break; }
++
++    Pair lower_best{-INFINITY, -1};
++#pragma unroll
++    for (int item = 0; item < ITEMS_PER_THREAD; ++item) {
++      const int pos = tid + item * TPB;
++      if (pos < n_ws && f_u < local_f[item] &&
++          in_lower(local_a[item], local_y[item], local_C[item])) {
++        const math_t eta = max(Kd[pos] + Kd[u] - math_t{2} * local_Kui[item], ETA_EPS);
++        const math_t residual = f_u - local_f[item];
++        const math_t score    = residual * residual / eta;
++        if (score > lower_best.val) { lower_best = Pair{score, pos}; }
++      }
++    }
++    result = BlockReducePair(temp_storage.pair).Reduce(lower_best, cuda::maximum{});
++    if (tid == 0) { l = result.key; }
++    __syncthreads();
++
++#pragma unroll
++    for (int item = 0; item < ITEMS_PER_THREAD; ++item) {
++      const int pos = tid + item * TPB;
++      if (pos == u) {
++        tmp_u = local_y[item] > 0 ? local_C[item] - local_a[item] : local_a[item];
++      }
++      if (pos == l) {
++        const math_t eta = max(Kd[u] + Kd[l] - math_t{2} * local_Kui[item], ETA_EPS);
++        tmp_l = local_y[item] > 0 ? local_a[item] : local_C[item] - local_a[item];
++        tmp_l = min(tmp_l, (local_f[item] - f_u) / eta);
++      }
++    }
++    __syncthreads();
++    const math_t q = min(tmp_u, tmp_l);
++
++#pragma unroll
++    for (int item = 0; item < ITEMS_PER_THREAD; ++item) {
++      const int pos = tid + item * TPB;
++      if (pos < n_ws) {
++        const math_t Kli = kernel[static_cast<size_t>(l) * n_ws + pos];
++        if (pos == u) { local_a[item] += q * local_y[item]; }
++        if (pos == l) { local_a[item] -= q * local_y[item]; }
++        local_f[item] += q * (local_Kui[item] - Kli);
++      }
++    }
++    if (q == 0) { break; }
++  }
++
++#pragma unroll
++  for (int item = 0; item < ITEMS_PER_THREAD; ++item) {
++    const int pos = tid + item * TPB;
++    if (pos < n_ws) {
++      const int idx    = ws_idx[pos];
++      alpha[idx]       = local_a[item];
++      delta_alpha[pos] = (local_a[item] - local_a_save[item]) * local_y[item];
++    }
++  }
++  if (tid == 0) { return_buff[1] = n_iter; }
++  (void)n_train;
++  (void)svmType;
++}
+ };  // end namespace SVM
+ };  // end namespace ML
+diff --git a/cpp/src/svm/smosolver.cuh b/cpp/src/svm/smosolver.cuh
+index 71a976c..fce44d7 100644
+--- a/cpp/src/svm/smosolver.cuh
++++ b/cpp/src/svm/smosolver.cuh
+@@ -9,6 +9,8 @@
+ 
+ // #TODO: Replace with public header when ready
+ #include "kernelcache.cuh"
++#include <fused_rbf_column_cache.cuh>
++#include <fused_rbf_solver_update.cuh>
+ #include "results.cuh"
+ #include "smo_sets.cuh"
+ #include "smoblocksolve.cuh"
+@@ -16,6 +18,7 @@
+ #include "ws_util.cuh"
+ 
+ #include <raft/core/handle.hpp>
++#include <raft/core/nvtx.hpp>
+ #include <raft/linalg/detail/cublas_wrappers.hpp>
+ #include <raft/linalg/gemv.cuh>
+ #include <raft/linalg/unary_op.cuh>
+@@ -30,14 +33,25 @@
+ #include <thrust/iterator/constant_iterator.h>
+ #include <thrust/sequence.h>
+ 
++#include <cuda_fp16.h>
++
++#include <algorithm>
++#include <array>
+ #include <cassert>
+ #include <chrono>
++#include <cmath>
++#include <cstdint>
+ #include <cstdlib>
++#include <fstream>
++#include <iomanip>
+ #include <iostream>
+ #include <limits>
+ #include <sstream>
++#include <set>
++#include <stdexcept>
+ #include <string>
+ #include <type_traits>
++#include <vector>
+ 
+ namespace ML {
+ namespace SVM {
+@@ -131,84 +145,1299 @@ void SmoSolver<math_t>::Solve(MatrixViewType matrix,
+   rmm::device_uvector<math_t> nz_da(n_ws, stream);
+   rmm::device_uvector<int> nz_da_idx(n_ws, stream);
+ 
++  const char* fused_env = std::getenv("CUML_SVM_FUSED_RBF_UPDATE");
++  const bool fused_requested = fused_env != nullptr && std::string(fused_env) == "1";
++  const char* fp16_tma_env = std::getenv("CUML_SVM_FP16_TMA_RBF");
++  const bool fp16_tma_requested = fp16_tma_env != nullptr && std::string(fp16_tma_env) == "1";
++  const char* repair_env = std::getenv("CUML_SVM_FP16_TMA_REPAIR");
++  const bool repair_requested = repair_env != nullptr && std::string(repair_env) == "1";
++  const char* block_threads_env = std::getenv("CUML_SVM_BLOCK_THREADS");
++  const int block_threads = block_threads_env != nullptr ? std::atoi(block_threads_env) : 1024;
++  bool direct_fused_supported = false;
++  bool tiled_fused_supported  = false;
++  bool fp16_tma_supported          = false;
++  if constexpr (std::is_same_v<math_t, float> && isDenseType<MatrixViewType>()) {
++    const bool common_supported =
++      svmType == C_SVC && kernel_type == cuvs::distance::kernels::KernelType::RBF &&
++      !is_precomputed && matrix.stride(0) == 1 && matrix.stride(1) == n_rows;
++    direct_fused_supported = common_supported && n_cols == 18;
++    tiled_fused_supported  = common_supported && n_cols >= 256 && n_rows >= 65536;
++    if (fp16_tma_requested && common_supported && n_cols >= 256 && n_rows >= 65536 &&
++        n_rows % 128 == 0 && n_ws <= 1024) {
++      int device = 0;
++      cudaDeviceProp properties{};
++      RAFT_CUDA_TRY(cudaGetDevice(&device));
++      RAFT_CUDA_TRY(cudaGetDeviceProperties(&properties, device));
++      fp16_tma_supported = properties.major == 12 && properties.minor == 0;
++    }
++  }
++  const bool use_fp16_tma          = fp16_tma_requested && fp16_tma_supported;
++  const bool use_direct_fused = fused_requested && direct_fused_supported && !use_fp16_tma;
++  const bool use_tiled_fused  = fused_requested && tiled_fused_supported && !use_fp16_tma;
++  const bool use_legacy_fused = use_direct_fused || use_tiled_fused;
++  const bool use_fused        = use_legacy_fused || use_fp16_tma;
++  const bool use_fp16_tma_repair   = use_fp16_tma && repair_requested;
++  const char* bounded_cache_env = std::getenv("CUML_SVM_BOUNDED_CACHE");
++  const bool bounded_cache_requested =
++    bounded_cache_env != nullptr && std::string(bounded_cache_env) == "1";
++  const char* persistent_fp16_cache_env =
++    std::getenv("CUML_SVM_FP16_PERSISTENT_CACHE");
++  const bool persistent_fp16_cache_requested =
++    persistent_fp16_cache_env != nullptr &&
++    std::string(persistent_fp16_cache_env) == "1";
++  const char* coherent_fp16_tile_env =
++    std::getenv("CUML_SVM_FP16_COHERENT_TILE");
++  const bool coherent_fp16_tile_requested =
++    coherent_fp16_tile_env != nullptr &&
++    std::string(coherent_fp16_tile_env) == "1";
++  const char* direct_slotted_cache_env =
++    std::getenv("CUML_SVM_DIRECT_SLOTTED_CACHE");
++  const bool direct_slotted_cache_requested =
++    direct_slotted_cache_env != nullptr &&
++    std::string(direct_slotted_cache_env) == "1";
++  if (persistent_fp16_cache_requested && direct_slotted_cache_requested) {
++    throw std::runtime_error(
++      "Select either CUML_SVM_FP16_PERSISTENT_CACHE or "
++      "CUML_SVM_DIRECT_SLOTTED_CACHE, not both");
++  }
++  const char* column_cache_columns_env =
++    std::getenv("CUML_SVM_COLUMN_CACHE_COLUMNS");
++  int requested_cache_columns = 0;
++  if (column_cache_columns_env != nullptr) {
++    requested_cache_columns = std::atoi(column_cache_columns_env);
++    if (requested_cache_columns <= 0) {
++      throw std::runtime_error("CUML_SVM_COLUMN_CACHE_COLUMNS must be positive");
++    }
++  }
++  const char* column_cache_gib_env = std::getenv("CUML_SVM_COLUMN_CACHE_GIB");
++  const double column_cache_gib =
++    column_cache_gib_env != nullptr ? std::max(0.0, std::atof(column_cache_gib_env)) : 0.0;
++  const size_t requested_cache_element_bytes =
++    bounded_cache_requested && persistent_fp16_cache_requested ? sizeof(__half)
++                                                                : sizeof(float);
++  int column_cache_capacity = 0;
++  if (use_fp16_tma && requested_cache_columns > 0) {
++    column_cache_capacity = std::min(n_rows, requested_cache_columns);
++  } else if (use_fp16_tma && column_cache_gib > 0.0) {
++    const long double requested_bytes =
++      static_cast<long double>(column_cache_gib) * 1024.0L * 1024.0L * 1024.0L;
++    const long double bytes_per_column =
++      static_cast<long double>(n_rows) * requested_cache_element_bytes;
++    column_cache_capacity = static_cast<int>(std::min<long double>(
++      n_rows, std::floor(requested_bytes / bytes_per_column)));
++  }
++  const bool use_column_cache = use_fp16_tma && column_cache_capacity > 0;
++  const bool use_bounded_column_cache =
++    use_column_cache && bounded_cache_requested;
++  const bool use_fp16_persistent_cache =
++    use_bounded_column_cache && persistent_fp16_cache_requested;
++  const bool use_fp16_coherent_tile =
++    use_fp16_persistent_cache && coherent_fp16_tile_requested;
++  if (coherent_fp16_tile_requested && !use_fp16_persistent_cache) {
++    throw std::runtime_error(
++      "CUML_SVM_FP16_COHERENT_TILE=1 requires the active bounded "
++      "CUML_SVM_FP16_PERSISTENT_CACHE=1 path");
++  }
++  if (use_fp16_coherent_tile && n_ws % 128 != 0) {
++    throw std::runtime_error(
++      "CUML_SVM_FP16_COHERENT_TILE requires a working-set size divisible by 128");
++  }
++  const bool use_direct_slotted_float_cache =
++    use_bounded_column_cache && direct_slotted_cache_requested;
++  const char* cache_fp32_env = std::getenv("CUML_SVM_CACHE_MATERIALIZE_FP32");
++  const bool use_fp32_cache_materialization =
++    use_bounded_column_cache && cache_fp32_env != nullptr &&
++    std::string(cache_fp32_env) == "1";
++  const char* cache_fp16_env = std::getenv("CUML_SVM_CACHE_MATERIALIZE_FP16");
++  const bool use_fp16_cache_materialization =
++    use_bounded_column_cache && cache_fp16_env != nullptr &&
++    std::string(cache_fp16_env) == "1";
++  if ((use_fp32_cache_materialization && use_fp16_cache_materialization) ||
++      ((use_fp16_persistent_cache || use_direct_slotted_float_cache) &&
++       (use_fp32_cache_materialization || use_fp16_cache_materialization))) {
++    throw std::runtime_error(
++      "Direct slotted cache modes and CACHE_MATERIALIZE_FP32/FP16 are "
++      "mutually exclusive");
++  }
++  const char* overlap_prefetch_env = std::getenv("CUML_SVM_OVERLAP_PREFETCH");
++  const bool use_overlap_prefetch =
++    use_column_cache && !use_bounded_column_cache && overlap_prefetch_env != nullptr &&
++    std::string(overlap_prefetch_env) == "1";
++  const char* persist_block_tile_env = std::getenv("CUML_SVM_PERSIST_BLOCK_TILE");
++  const bool use_persist_block_tile =
++    use_overlap_prefetch && persist_block_tile_env != nullptr &&
++    std::string(persist_block_tile_env) == "1";
++  const char* fp16_tma_cache_min_cols_env = std::getenv("CUML_SVM_FP16_TMA_CACHE_MIN_COLS");
++  const int fp16_tma_cache_min_cols = fp16_tma_cache_min_cols_env != nullptr
++                                   ? std::max(1, std::atoi(fp16_tma_cache_min_cols_env))
++                                   : 128;
++  const bool use_adaptive_fp16_tma_cache =
++    use_bounded_column_cache &&
++    !(use_fp32_cache_materialization || use_fp16_cache_materialization);
++  const int fused_tile_rows   = use_tiled_fused ? std::min(n_rows, 262144) : 0;
++  rmm::device_uvector<math_t> fused_norm_x(use_fused ? n_rows : 0, stream);
++  rmm::device_uvector<math_t> fused_norm_ws(use_legacy_fused ? n_ws : 0, stream);
++  rmm::device_uvector<math_t> fused_ws(
++    use_legacy_fused ? static_cast<size_t>(n_ws) * n_cols : 0, stream);
++  rmm::device_uvector<math_t> fused_panel(
++    use_tiled_fused ? static_cast<size_t>(fused_tile_rows) * n_ws : 0, stream);
++
++  // The column-cache path also uses the FP16 TMA mainloop for sufficiently large
++  // first-use batches, so keep its repacked X, working-set buckets and tensor
++  // maps alive whenever FP16 TMA is enabled.
++  const int fp16_tma_dim_padded = use_fp16_tma ? raft::ceildiv(n_cols, 64) * 64 : 0;
++  const int fp16_tma_max_cols   = use_fp16_tma ? raft::ceildiv(n_ws, 128) * 128 : 0;
++  const int fp16_tma_max_tiles  = use_fp16_tma ? fp16_tma_max_cols / 128 : 0;
++  rmm::device_uvector<__half> fp16_tma_x(
++    use_fp16_tma ? static_cast<size_t>(n_rows) * fp16_tma_dim_padded : 0, stream);
++  rmm::device_uvector<__half> fp16_tma_ws(
++    use_fp16_tma ? static_cast<size_t>(fp16_tma_max_cols) * fp16_tma_dim_padded : 0, stream);
++  rmm::device_uvector<float> fp16_tma_norm_ws(use_fp16_tma ? fp16_tma_max_cols : 0, stream);
++  rmm::device_uvector<float> fp16_tma_delta(use_fp16_tma ? fp16_tma_max_cols : 0, stream);
++  rmm::device_uvector<float> fp16_tma_partial(
++    use_fp16_tma ? static_cast<size_t>(n_rows) * fp16_tma_max_tiles : 0, stream);
++  std::array<void*, 8> fp16_tma_contexts{};
++
++  // Coherent-tile experiment: evaluate K[W,W] with the same FP16-input TMA
++  // mainloop and FP32 RBF epilogue used for full-gradient cache misses, round
++  // it to the same persistent half representation, then expand to FP32 for the
++  // unchanged block solver.
++  rmm::device_uvector<__half> fp16_coherent_tile(
++    use_fp16_coherent_tile ? static_cast<size_t>(n_ws) * n_ws : 0, stream);
++  rmm::device_uvector<int> fp16_coherent_slots(
++    use_fp16_coherent_tile ? n_ws : 0, stream);
++  rmm::device_uvector<float> fp16_coherent_zero_delta(
++    use_fp16_coherent_tile ? n_ws : 0, stream);
++  void* fp16_coherent_tile_context = nullptr;
++
++  rmm::device_uvector<float> column_cache(
++    use_column_cache && !use_fp16_persistent_cache
++      ? static_cast<size_t>(column_cache_capacity) * n_rows
++      : 0,
++    stream);
++  rmm::device_uvector<__half> column_cache_fp16(
++    use_fp16_persistent_cache
++      ? static_cast<size_t>(column_cache_capacity) * n_rows
++      : 0,
++    stream);
++  rmm::device_uvector<float> column_cache_ws(
++    use_column_cache ? static_cast<size_t>(n_ws) * n_cols : 0, stream);
++  rmm::device_uvector<__half> column_cache_x_fp16(
++    use_fp16_cache_materialization ? static_cast<size_t>(n_rows) * n_cols : 0, stream);
++  rmm::device_uvector<__half> column_cache_ws_fp16(
++    use_fp16_cache_materialization ? static_cast<size_t>(n_ws) * n_cols : 0, stream);
++  rmm::device_uvector<float> column_cache_norm_ws(use_column_cache ? n_ws : 0, stream);
++  rmm::device_uvector<int> column_cache_new_indices(use_column_cache ? n_ws : 0, stream);
++  rmm::device_uvector<float> column_cache_new_delta(use_column_cache ? n_ws : 0, stream);
++  rmm::device_uvector<int> column_cache_hit_slots(use_column_cache ? n_ws : 0, stream);
++  rmm::device_uvector<float> column_cache_hit_delta(use_column_cache ? n_ws : 0, stream);
++  rmm::device_uvector<float> column_cache_staging(
++    use_bounded_column_cache && !use_fp16_persistent_cache &&
++        !use_direct_slotted_float_cache
++      ? static_cast<size_t>(n_ws) * n_rows
++      : 0,
++    stream);
++  rmm::device_uvector<int> column_cache_new_slots(
++    use_bounded_column_cache ? n_ws : 0, stream);
++  std::vector<int> column_cache_slot_of(use_column_cache ? n_rows : 0, -1);
++  std::vector<int> column_cache_active_indices(use_column_cache ? n_ws : 0);
++  std::vector<math_t> column_cache_active_delta(use_column_cache ? n_ws : 0);
++  std::vector<int> column_cache_new_indices_host(use_column_cache ? n_ws : 0);
++  std::vector<math_t> column_cache_new_delta_host(use_column_cache ? n_ws : 0);
++  std::vector<int> column_cache_hit_slots_host(use_column_cache ? n_ws : 0);
++  std::vector<math_t> column_cache_hit_delta_host(use_column_cache ? n_ws : 0);
++  std::vector<int> column_cache_new_slots_host(use_bounded_column_cache ? n_ws : 0);
++  std::vector<int> column_cache_index_of_slot(
++    use_bounded_column_cache ? column_cache_capacity : 0, -1);
++  std::vector<std::uint64_t> column_cache_last_used(
++    use_bounded_column_cache ? column_cache_capacity : 0, 0);
++  std::vector<unsigned char> column_cache_pinned(
++    use_bounded_column_cache ? column_cache_capacity : 0, 0);
++  std::set<std::pair<std::uint64_t, int>> column_cache_lru;
++  int* column_cache_prefetch_ws_host = nullptr;
++  std::vector<int> column_cache_prefetch_indices_host(use_overlap_prefetch ? n_ws : 0);
++  cudaStream_t column_cache_prefetch_stream = nullptr;
++  cudaEvent_t column_cache_prefetch_plan_ready = nullptr;
++  cudaEvent_t column_cache_prefetch_start = nullptr;
++  cudaEvent_t column_cache_prefetch_done = nullptr;
++  if (use_overlap_prefetch) {
++    RAFT_CUDA_TRY(cudaHostAlloc(reinterpret_cast<void**>(&column_cache_prefetch_ws_host),
++                                n_ws * sizeof(int),
++                                cudaHostAllocDefault));
++    int least_priority = 0;
++    int greatest_priority = 0;
++    RAFT_CUDA_TRY(cudaDeviceGetStreamPriorityRange(&least_priority, &greatest_priority));
++    RAFT_CUDA_TRY(cudaStreamCreateWithPriority(
++      &column_cache_prefetch_stream, cudaStreamNonBlocking, least_priority));
++    RAFT_CUDA_TRY(cudaEventCreateWithFlags(
++      &column_cache_prefetch_plan_ready, cudaEventDisableTiming));
++    RAFT_CUDA_TRY(cudaEventCreateWithFlags(
++      &column_cache_prefetch_start, cudaEventDisableTiming));
++    RAFT_CUDA_TRY(cudaEventCreateWithFlags(
++      &column_cache_prefetch_done, cudaEventDisableTiming));
++  }
++
++  const int repair_tile_rows = use_fp16_tma_repair ? std::min(n_rows, 65536) : 0;
++  rmm::device_uvector<float> repair_signed_alpha(use_fp16_tma_repair ? n_rows : 0, stream);
++  rmm::device_uvector<float> repair_delta(use_fp16_tma_repair ? n_rows : 0, stream);
++  rmm::device_uvector<int> repair_all_indices(use_fp16_tma_repair ? n_rows : 0, stream);
++  rmm::device_uvector<int> repair_indices(use_fp16_tma_repair ? n_rows : 0, stream);
++  rmm::device_uvector<float> repair_ws(
++    use_fp16_tma_repair ? static_cast<size_t>(n_ws) * n_cols : 0, stream);
++  rmm::device_uvector<float> repair_norm_ws(use_fp16_tma_repair ? n_ws : 0, stream);
++  rmm::device_uvector<float> repair_panel(
++    use_fp16_tma_repair ? static_cast<size_t>(repair_tile_rows) * n_ws : 0, stream);
++  if constexpr (std::is_same_v<math_t, float> && isDenseType<MatrixViewType>()) {
++    if (use_fused) {
++      ML::SVM::matrixRowNorm(
++        handle, matrix, fused_norm_x.data(), raft::linalg::NormType::L2Norm);
++    }
++    if (use_fp16_cache_materialization) {
++      fused_rbf::column_cache::prepare_fp16_matrix(
++        getDenseData(matrix),
++        column_cache_x_fp16.data(),
++        static_cast<size_t>(n_rows) * n_cols,
++        stream);
++    }
++    if (use_fp16_tma) {
++      fused_rbf::launch_fp16_tma_repack(getDenseData(matrix),
++                                   fp16_tma_x.data(),
++                                   n_rows,
++                                   n_cols,
++                                   fp16_tma_dim_padded,
++                                   stream);
++      for (int tile_count = 1; tile_count <= fp16_tma_max_tiles; ++tile_count) {
++        fp16_tma_contexts[tile_count - 1] = fp16_tma_rbf_create_context(fp16_tma_x.data(),
++                                                              fp16_tma_ws.data(),
++                                                              n_rows,
++                                                              tile_count * 128,
++                                                              fp16_tma_dim_padded);
++        if (fp16_tma_contexts[tile_count - 1] == nullptr) {
++          throw std::runtime_error("Unable to create SM120 FP16 TMA RBF tensor-map context");
++        }
++      }
++      if (use_fp16_coherent_tile) {
++        fp16_coherent_tile_context = fp16_tma_rbf_create_context(fp16_tma_ws.data(),
++                                                                 fp16_tma_ws.data(),
++                                                                 n_ws,
++                                                                 n_ws,
++                                                                 fp16_tma_dim_padded);
++        if (fp16_coherent_tile_context == nullptr) {
++          throw std::runtime_error(
++            "Unable to create SM120 coherent FP16 working-set tile context");
++        }
++        thrust::sequence(thrust::cuda::par.on(stream),
++                         fp16_coherent_slots.data(),
++                         fp16_coherent_slots.data() + n_ws);
++        RAFT_CUDA_TRY(cudaMemsetAsync(fp16_coherent_zero_delta.data(),
++                                      0,
++                                      n_ws * sizeof(float),
++                                      stream));
++      }
++      RAFT_CUDA_TRY(cudaPeekAtLastError());
++    }
++    if (use_fp16_tma_repair) {
++      thrust::sequence(thrust::cuda::par.on(stream),
++                       repair_all_indices.data(),
++                       repair_all_indices.data() + n_rows);
++    }
++  }
++  long long fused_updates   = 0;
++  long long fused_nnz_total = 0;
++  long long fp16_tma_padded_total = 0;
++  long long repair_updates   = 0;
++  long long repair_refreshes = 0;
++  long long repair_supports  = 0;
++  long long column_cache_new_total = 0;
++  long long column_cache_hit_total = 0;
++  long long column_cache_fp16_tma_updates = 0;
++  long long column_cache_fp16_tma_columns = 0;
++  long long column_cache_fp32_updates = 0;
++  long long column_cache_fp32_columns = 0;
++  long long column_cache_fp16_updates = 0;
++  long long column_cache_fp16_columns = 0;
++  long long column_cache_fp16_fallback_updates = 0;
++  long long column_cache_fp16_fallback_columns = 0;
++  long long column_cache_prefetch_updates = 0;
++  long long column_cache_prefetch_columns = 0;
++  long long column_cache_evictions = 0;
++  bool persist_block_tile_configured = false;
++  size_t persist_block_tile_bytes = 0;
++  int column_cache_next_slot       = 0;
++  std::uint64_t column_cache_access_clock = 0;
++  bool fp16_tma_repair_mode       = false;
++
++  const char* trace_path_env = std::getenv("CUML_SVM_TRACE_PATH");
++  const bool trace_enabled = trace_path_env != nullptr && trace_path_env[0] != '\0';
++  std::ofstream trace_stream;
++  std::vector<int> trace_ws(trace_enabled ? n_ws : 0);
++  std::vector<int> trace_selected(trace_enabled ? n_ws : 0);
++  std::vector<int> trace_idx(trace_enabled ? n_ws : 0);
++  std::vector<math_t> trace_da(trace_enabled ? n_ws : 0);
++  const char* trace_state_dir_env = std::getenv("CUML_SVM_TRACE_STATE_DIR");
++  const char* trace_state_every_env = std::getenv("CUML_SVM_TRACE_STATE_EVERY");
++  const char* trace_state_gap_env = std::getenv("CUML_SVM_TRACE_STATE_GAP");
++  const bool trace_state_enabled =
++    trace_enabled && trace_state_dir_env != nullptr && trace_state_dir_env[0] != '\0';
++  const int trace_state_every =
++    trace_state_every_env != nullptr ? std::max(0, std::atoi(trace_state_every_env)) : 0;
++  const double trace_state_gap =
++    trace_state_gap_env != nullptr ? std::atof(trace_state_gap_env) : -1.0;
++  rmm::device_uvector<math_t> trace_f_before(trace_state_enabled ? n_train : 0, stream);
++  std::vector<math_t> trace_f_before_host(trace_state_enabled ? n_train : 0);
++  std::vector<math_t> trace_f_after_host(trace_state_enabled ? n_train : 0);
++  std::vector<math_t> trace_alpha_after_host(trace_state_enabled ? n_train : 0);
++  if (trace_enabled) {
++    trace_stream.open(trace_path_env, std::ios::out | std::ios::trunc);
++    if (!trace_stream.is_open()) {
++      throw std::runtime_error(std::string("Unable to open CUML_SVM_TRACE_PATH: ") +
++                               trace_path_env);
++    }
++    trace_stream << std::setprecision(std::numeric_limits<math_t>::max_digits10);
++    trace_stream << "{\"type\":\"meta\",\"schema\":2,\"n_rows\":" << n_rows
++                 << ",\"n_cols\":" << n_cols << ",\"n_ws\":" << n_ws
++                 << ",\"state_dtype\":\"float32\"}\n";
++  }
++
+   while (keep_going) {
+-    RAFT_CUDA_TRY(cudaMemsetAsync(delta_alpha.data(), 0, n_ws * sizeof(math_t), stream));
+-    raft::common::nvtx::push_range("SmoSolver::ws_select");
+-    ws.Select(f.data(), alpha.data(), y, C_vec.data());
+-    raft::common::nvtx::pop_range();
+-    RAFT_CUDA_TRY(cudaPeekAtLastError());
+-    raft::common::nvtx::push_range("SmoSolver::Kernel");
++    bool trace_state_this_iteration = false;
++    std::string trace_state_prefix;
++    int overlap_prefetch_count = 0;
++    int overlap_prefetch_padded_cols = 0;
++    int overlap_prefetch_start_slot = 0;
++    bool overlap_prefetch_launched = false;
++    {
++      raft::common::nvtx::range<> stage{"SmoSolver::ws_select"};
++      RAFT_CUDA_TRY(cudaMemsetAsync(delta_alpha.data(), 0, n_ws * sizeof(math_t), stream));
++      ws.Select(f.data(), alpha.data(), y, C_vec.data());
++      RAFT_CUDA_TRY(cudaPeekAtLastError());
++      if (trace_enabled) {
++        raft::update_host(trace_selected.data(), ws.GetIndices(), n_ws, stream);
++      }
++    }
+ 
+     cache.InitWorkingSet(ws.GetIndices());
+ 
+-    math_t* cacheTile = cache.getSquareTileWithoutCaching();
+-
+-    raft::common::nvtx::pop_range();
+-    raft::common::nvtx::push_range("SmoSolver::SmoBlockSolve");
+-    int max_iter_this_block =
+-      (max_iter == -1 ? max_inner_iter : std::min(max_inner_iter, max_iter - n_iter));
+-    SmoBlockSolve<math_t, SMO_WS_SIZE><<<1, n_ws, 0, stream>>>(y,
+-                                                               n_train,
+-                                                               alpha.data(),
+-                                                               n_ws,
+-                                                               delta_alpha.data(),
+-                                                               f.data(),
+-                                                               cacheTile,
+-                                                               cache.getKernelIndices(true),
+-                                                               C_vec.data(),
+-                                                               tol,
+-                                                               return_buff.data(),
+-                                                               max_iter_this_block,
+-                                                               svmType);
+-
+-    RAFT_CUDA_TRY(cudaPeekAtLastError());
+-
+-    raft::update_host(host_return_buff, return_buff.data(), 2, stream);
+-    raft::common::nvtx::pop_range();
+-    raft::common::nvtx::push_range("SmoSolver::UpdateF");
+-    raft::common::nvtx::push_range("SmoSolver::UpdateF::getNnzDaRows");
++    if (use_overlap_prefetch) {
++      RAFT_CUDA_TRY(cudaMemcpyAsync(column_cache_prefetch_ws_host,
++                                    cache.getKernelIndices(false),
++                                    n_ws * sizeof(int),
++                                    cudaMemcpyDeviceToHost,
++                                    stream));
++      RAFT_CUDA_TRY(cudaEventRecord(column_cache_prefetch_plan_ready, stream));
++    }
++
++    math_t* cacheTile = use_fp16_coherent_tile
++                          ? cache.getSquareTileStorageWithoutCompute()
++                          : cache.getSquareTileWithoutCaching();
++
++    if constexpr (std::is_same_v<math_t, float> && isDenseType<MatrixViewType>()) {
++      if (use_fp16_coherent_tile) {
++        raft::common::nvtx::range<> stage{"SmoSolver::fp16_coherent_working_set_kernel"};
++        // The same repacked half input and original FP32 norms used by the
++        // persistent full-gradient cache are used here. Identity slots make
++        // the half output a column-major K[W,W] tile.
++        fused_rbf::launch_fp16_tma_gather(fp16_tma_x.data(),
++                                          cache.getKernelIndices(false),
++                                          fp16_coherent_zero_delta.data(),
++                                          fused_norm_x.data(),
++                                          fp16_tma_ws.data(),
++                                          fp16_tma_norm_ws.data(),
++                                          fp16_tma_delta.data(),
++                                          n_ws,
++                                          n_ws,
++                                          fp16_tma_dim_padded,
++                                          stream);
++        const int coherent_status = fp16_tma_rbf_materialize_slotted_half_cache(
++          fp16_coherent_tile_context,
++          fp16_tma_norm_ws.data(),
++          fp16_tma_norm_ws.data(),
++          fp16_tma_delta.data(),
++          fp16_coherent_slots.data(),
++          fp16_coherent_tile.data(),
++          n_ws,
++          static_cast<float>(rbf_gamma),
++          reinterpret_cast<void*>(stream));
++        RAFT_CUDA_TRY(static_cast<cudaError_t>(coherent_status));
++        fused_rbf::column_cache::expand_fp16_matrix(fp16_coherent_tile.data(),
++                                                    cacheTile,
++                                                    static_cast<size_t>(n_ws) * n_ws,
++                                                    stream);
++        RAFT_CUDA_TRY(cudaPeekAtLastError());
++      }
++    }
++
++    if (use_persist_block_tile && !persist_block_tile_configured) {
++      int device = 0;
++      cudaDeviceProp properties{};
++      RAFT_CUDA_TRY(cudaGetDevice(&device));
++      RAFT_CUDA_TRY(cudaGetDeviceProperties(&properties, device));
++      const size_t tile_bytes = static_cast<size_t>(n_ws) * n_ws * sizeof(math_t);
++      persist_block_tile_bytes = std::min<size_t>(
++        tile_bytes,
++        std::min<size_t>(properties.persistingL2CacheMaxSize,
++                         properties.accessPolicyMaxWindowSize));
++      if (persist_block_tile_bytes > 0) {
++        RAFT_CUDA_TRY(cudaDeviceSetLimit(cudaLimitPersistingL2CacheSize,
++                                         persist_block_tile_bytes));
++        cudaStreamAttrValue attribute{};
++        attribute.accessPolicyWindow.base_ptr = cacheTile;
++        attribute.accessPolicyWindow.num_bytes = persist_block_tile_bytes;
++        attribute.accessPolicyWindow.hitRatio = 1.0f;
++        attribute.accessPolicyWindow.hitProp = cudaAccessPropertyPersisting;
++        attribute.accessPolicyWindow.missProp = cudaAccessPropertyStreaming;
++        RAFT_CUDA_TRY(cudaStreamSetAttribute(
++          stream, cudaStreamAttributeAccessPolicyWindow, &attribute));
++      }
++      persist_block_tile_configured = true;
++    }
++
++    if (use_overlap_prefetch) {
++      raft::common::nvtx::range<> stage{"SmoSolver::column_cache_prefetch_plan"};
++      RAFT_CUDA_TRY(cudaEventSynchronize(column_cache_prefetch_plan_ready));
++      overlap_prefetch_start_slot = column_cache_next_slot;
++      for (int column = 0; column < n_ws; ++column) {
++        const int index = column_cache_prefetch_ws_host[column];
++        if (index < 0 || index >= n_rows) {
++          throw std::runtime_error("SMO prefetch index is out of range");
++        }
++        if (column_cache_slot_of[index] < 0) {
++          if (column_cache_next_slot >= column_cache_capacity) {
++            throw std::runtime_error(
++              "CUML_SVM_COLUMN_CACHE_GIB capacity exhausted during prefetch");
++          }
++          column_cache_slot_of[index] = column_cache_next_slot++;
++          column_cache_prefetch_indices_host[overlap_prefetch_count++] = index;
++        }
++      }
++      if (overlap_prefetch_count > 0) {
++        overlap_prefetch_padded_cols =
++          raft::ceildiv(overlap_prefetch_count, 128) * 128;
++        RAFT_CUDA_TRY(cudaEventRecord(column_cache_prefetch_start, stream));
++      }
++    }
++
++    {
++      raft::common::nvtx::range<> stage{"SmoSolver::block_solve"};
++      int max_iter_this_block =
++        (max_iter == -1 ? max_inner_iter : std::min(max_inner_iter, max_iter - n_iter));
++      if (n_ws == SMO_WS_SIZE && block_threads == 512) {
++        SmoBlockSolveCoarsened<math_t, 512, 2><<<1, 512, 0, stream>>>(
++          y,
++          n_train,
++          alpha.data(),
++          n_ws,
++          delta_alpha.data(),
++          f.data(),
++          cacheTile,
++          cache.getKernelIndices(true),
++          C_vec.data(),
++          tol,
++          return_buff.data(),
++          max_iter_this_block,
++          svmType);
++      } else if (n_ws == SMO_WS_SIZE && block_threads == 256) {
++        SmoBlockSolveCoarsened<math_t, 256, 4><<<1, 256, 0, stream>>>(
++          y,
++          n_train,
++          alpha.data(),
++          n_ws,
++          delta_alpha.data(),
++          f.data(),
++          cacheTile,
++          cache.getKernelIndices(true),
++          C_vec.data(),
++          tol,
++          return_buff.data(),
++          max_iter_this_block,
++          svmType);
++      } else if (n_ws == SMO_WS_SIZE && block_threads == 128) {
++        SmoBlockSolveCoarsened<math_t, 128, 8><<<1, 128, 0, stream>>>(
++          y,
++          n_train,
++          alpha.data(),
++          n_ws,
++          delta_alpha.data(),
++          f.data(),
++          cacheTile,
++          cache.getKernelIndices(true),
++          C_vec.data(),
++          tol,
++          return_buff.data(),
++          max_iter_this_block,
++          svmType);
++      } else {
++        SmoBlockSolve<math_t, SMO_WS_SIZE><<<1, n_ws, 0, stream>>>(y,
++                                                                   n_train,
++                                                                   alpha.data(),
++                                                                   n_ws,
++                                                                   delta_alpha.data(),
++                                                                   f.data(),
++                                                                   cacheTile,
++                                                                   cache.getKernelIndices(true),
++                                                                   C_vec.data(),
++                                                                   tol,
++                                                                   return_buff.data(),
++                                                                   max_iter_this_block,
++                                                                   svmType);
++      }
++
++      RAFT_CUDA_TRY(cudaPeekAtLastError());
++      if constexpr (std::is_same_v<math_t, float> && isDenseType<MatrixViewType>()) {
++        if (overlap_prefetch_count > 0) {
++          raft::common::nvtx::range<> prefetch_stage{
++            "SmoSolver::column_cache_prefetch_launch"};
++          RAFT_CUDA_TRY(cudaStreamWaitEvent(column_cache_prefetch_stream,
++                                            column_cache_prefetch_start,
++                                            0));
++          raft::update_device(column_cache_new_indices.data(),
++                              column_cache_prefetch_indices_host.data(),
++                              overlap_prefetch_count,
++                              column_cache_prefetch_stream);
++          RAFT_CUDA_TRY(cudaMemsetAsync(column_cache_new_delta.data(),
++                                        0,
++                                        overlap_prefetch_padded_cols * sizeof(float),
++                                        column_cache_prefetch_stream));
++          fused_rbf::launch_fp16_tma_gather(fp16_tma_x.data(),
++                                       column_cache_new_indices.data(),
++                                       column_cache_new_delta.data(),
++                                       fused_norm_x.data(),
++                                       fp16_tma_ws.data(),
++                                       fp16_tma_norm_ws.data(),
++                                       fp16_tma_delta.data(),
++                                       overlap_prefetch_count,
++                                       overlap_prefetch_padded_cols,
++                                       fp16_tma_dim_padded,
++                                       column_cache_prefetch_stream);
++          const int tile_count = overlap_prefetch_padded_cols / 128;
++          const int prefetch_status = fp16_tma_rbf_materialize_cache(
++            fp16_tma_contexts[tile_count - 1],
++            fused_norm_x.data(),
++            fp16_tma_norm_ws.data(),
++            fp16_tma_delta.data(),
++            column_cache.data() +
++              static_cast<size_t>(overlap_prefetch_start_slot) * n_rows,
++            overlap_prefetch_count,
++            static_cast<float>(rbf_gamma),
++            reinterpret_cast<void*>(column_cache_prefetch_stream));
++          RAFT_CUDA_TRY(static_cast<cudaError_t>(prefetch_status));
++          RAFT_CUDA_TRY(cudaEventRecord(column_cache_prefetch_done,
++                                        column_cache_prefetch_stream));
++          overlap_prefetch_launched = true;
++          column_cache_prefetch_updates++;
++          column_cache_prefetch_columns += overlap_prefetch_count;
++          column_cache_new_total += overlap_prefetch_count;
++          fp16_tma_padded_total += overlap_prefetch_padded_cols;
++        }
++      }
++      raft::update_host(host_return_buff, return_buff.data(), 2, stream);
++    }
++
+     int nnz_da;
+-    GetNonzeroDeltaAlpha(delta_alpha.data(),
+-                         n_ws,
+-                         cache.getKernelIndices(false),
+-                         nz_da.data(),
+-                         &nnz_da,
+-                         nz_da_idx.data(),
+-                         stream);
+-    RAFT_CUDA_TRY(cudaPeekAtLastError());
+-    // The following should be performed only for elements with nonzero delta_alpha
+-    if (nnz_da > 0) {
+-      auto batch_descriptor = cache.InitFullTileBatching(nz_da_idx.data(), nnz_da);
+-
+-      while (cache.getNextBatchKernel(batch_descriptor)) {
+-        raft::common::nvtx::pop_range();
+-        raft::common::nvtx::push_range("SmoSolver::UpdateF::updateBatch");
+-        // do (partial) update
+-        UpdateF(f.data() + batch_descriptor.offset,
+-                batch_descriptor.batch_size,
+-                nz_da.data(),
+-                nnz_da,
+-                batch_descriptor.kernel_data);
++    {
++      raft::common::nvtx::range<> stage{"SmoSolver::delta_alpha_compact"};
++      GetNonzeroDeltaAlpha(delta_alpha.data(),
++                           n_ws,
++                           cache.getKernelIndices(false),
++                           nz_da.data(),
++                           &nnz_da,
++                           nz_da_idx.data(),
++                           stream);
++      RAFT_CUDA_TRY(cudaPeekAtLastError());
++    }
++    if (overlap_prefetch_launched) {
++      RAFT_CUDA_TRY(cudaStreamWaitEvent(stream, column_cache_prefetch_done, 0));
++    }
++    if (trace_enabled) {
++      raft::update_host(trace_ws.data(), cache.getKernelIndices(false), n_ws, stream);
++      if (nnz_da > 0) {
++        raft::update_host(trace_idx.data(), nz_da_idx.data(), nnz_da, stream);
++        raft::update_host(trace_da.data(), nz_da.data(), nnz_da, stream);
++      }
++    }
++    if (trace_state_enabled) {
++      const double current_gap = std::abs(static_cast<double>(host_return_buff[0]));
++      trace_state_this_iteration =
++        (trace_state_every > 0 && n_outer_iter % trace_state_every == 0) ||
++        (trace_state_gap >= 0.0 && current_gap <= trace_state_gap);
++      if (trace_state_this_iteration) {
++        std::ostringstream prefix;
++        prefix << trace_state_dir_env << "/iter_" << std::setw(6) << std::setfill('0')
++               << n_outer_iter;
++        trace_state_prefix = prefix.str();
++        RAFT_CUDA_TRY(cudaMemcpyAsync(trace_f_before.data(),
++                                      f.data(),
++                                      n_train * sizeof(math_t),
++                                      cudaMemcpyDeviceToDevice,
++                                      stream));
++      }
++    }
++    bool update_completed              = false;
++    bool repair_started_this_iteration = false;
++    if constexpr (std::is_same_v<math_t, float> && isDenseType<MatrixViewType>()) {
++      const math_t current_diff = host_return_buff[0];
++      const bool start_repair = use_fp16_tma_repair && !fp16_tma_repair_mode &&
++                                std::abs(current_diff) <= math_t{10} * tol;
++      if (start_repair) {
++        raft::common::nvtx::range<> stage{"SmoSolver::fp16_tma_precision_repair"};
++        cache.FinishWorkingSetWithoutBatching();
++        fused_rbf::launch_signed_alpha(
++          alpha.data(), y, repair_signed_alpha.data(), n_rows, stream);
++        int repair_nnz = 0;
++        GetNonzeroDeltaAlpha(repair_signed_alpha.data(),
++                             n_rows,
++                             repair_all_indices.data(),
++                             repair_delta.data(),
++                             &repair_nnz,
++                             repair_indices.data(),
++                             stream);
++        raft::linalg::unaryOp(
++          f.data(), y, n_rows, [] __device__(math_t label) { return -label; }, stream);
++        for (int offset = 0; offset < repair_nnz; offset += n_ws) {
++          const int chunk = std::min(n_ws, repair_nnz - offset);
++          ML::SVM::extractRows<math_t>(
++            matrix, repair_ws.data(), repair_indices.data() + offset, chunk, handle);
++          cache.selectValueSubset(repair_norm_ws.data(),
++                                  fused_norm_x.data(),
++                                  repair_indices.data() + offset,
++                                  chunk);
++          fused_rbf::launch_tiled(handle.get_cublas_handle(),
++                                  getDenseData(matrix),
++                                  repair_ws.data(),
++                                  fused_norm_x.data(),
++                                  repair_norm_ws.data(),
++                                  repair_delta.data() + offset,
++                                  f.data(),
++                                  repair_panel.data(),
++                                  n_rows,
++                                  n_cols,
++                                  chunk,
++                                  repair_tile_rows,
++                                  static_cast<float>(rbf_gamma),
++                                  stream,
++                                  CUBLAS_COMPUTE_32F);
++        }
+         RAFT_CUDA_TRY(cudaPeekAtLastError());
++        fp16_tma_repair_mode               = true;
++        repair_started_this_iteration = true;
++        update_completed              = true;
++        repair_refreshes++;
++        repair_supports += repair_nnz;
++      }
++    }
++
++    // The following should be performed only for elements with nonzero delta_alpha.
++    if (nnz_da > 0 && !update_completed) {
++      if constexpr (std::is_same_v<math_t, float> && isDenseType<MatrixViewType>()) {
++        if (use_fused && !fp16_tma_repair_mode) {
++          raft::common::nvtx::range<> stage{"SmoSolver::fused_gradient_update"};
++          if (use_fp16_tma) {
++            if (use_column_cache) {
++              raft::common::nvtx::range<> cache_stage{"SmoSolver::column_cache_update"};
++              raft::update_host(
++                column_cache_active_indices.data(), nz_da_idx.data(), nnz_da, stream);
++              raft::update_host(
++                column_cache_active_delta.data(), nz_da.data(), nnz_da, stream);
++              handle.sync_stream(stream);
++
++              const int start_slot = column_cache_next_slot;
++              int new_count = 0;
++              int hit_count = 0;
++              if (use_bounded_column_cache) {
++                std::fill(column_cache_pinned.begin(), column_cache_pinned.end(), 0);
++                // Do not evict a cached column that this update still needs.
++                for (int column = 0; column < nnz_da; ++column) {
++                  const int index = column_cache_active_indices[column];
++                  if (index < 0 || index >= n_rows) {
++                    throw std::runtime_error("SMO column-cache index is out of range");
++                  }
++                  const int slot = column_cache_slot_of[index];
++                  if (slot >= 0) { column_cache_pinned[slot] = 1; }
++                }
++              }
++              for (int column = 0; column < nnz_da; ++column) {
++                const int index = column_cache_active_indices[column];
++                if (index < 0 || index >= n_rows) {
++                  throw std::runtime_error("SMO column-cache index is out of range");
++                }
++                int slot = column_cache_slot_of[index];
++                if (slot < 0) {
++                  if (use_bounded_column_cache) {
++                    if (column_cache_next_slot < column_cache_capacity) {
++                      slot = column_cache_next_slot++;
++                    } else {
++                      auto victim = column_cache_lru.begin();
++                      while (victim != column_cache_lru.end() &&
++                             column_cache_pinned[victim->second] != 0) {
++                        ++victim;
++                      }
++                      if (victim == column_cache_lru.end()) {
++                        throw std::runtime_error(
++                          "Bounded SMO column cache has no unpinned eviction slot");
++                      }
++                      slot = victim->second;
++                      column_cache_lru.erase(victim);
++                      const int evicted_index = column_cache_index_of_slot[slot];
++                      if (evicted_index >= 0) {
++                        column_cache_slot_of[evicted_index] = -1;
++                      }
++                      ++column_cache_evictions;
++                    }
++                    column_cache_slot_of[index]       = slot;
++                    column_cache_index_of_slot[slot] = index;
++                    column_cache_pinned[slot]        = 1;
++                    column_cache_last_used[slot]     = ++column_cache_access_clock;
++                    column_cache_lru.emplace(column_cache_last_used[slot], slot);
++                    column_cache_new_slots_host[new_count] = slot;
++                  } else {
++                    if (column_cache_next_slot >= column_cache_capacity) {
++                      throw std::runtime_error(
++                        "SMO column-cache capacity exhausted; increase GiB/columns or disable it");
++                    }
++                    slot = column_cache_next_slot++;
++                    column_cache_slot_of[index] = slot;
++                  }
++                  column_cache_new_indices_host[new_count] = index;
++                  column_cache_new_delta_host[new_count] = column_cache_active_delta[column];
++                  ++new_count;
++                } else {
++                  if (use_bounded_column_cache) {
++                    const auto old_position =
++                      column_cache_lru.find({column_cache_last_used[slot], slot});
++                    if (old_position != column_cache_lru.end()) {
++                      column_cache_lru.erase(old_position);
++                    }
++                    column_cache_last_used[slot] = ++column_cache_access_clock;
++                    column_cache_lru.emplace(column_cache_last_used[slot], slot);
++                  }
++                  column_cache_hit_slots_host[hit_count] = slot;
++                  column_cache_hit_delta_host[hit_count] = column_cache_active_delta[column];
++                  ++hit_count;
++                }
++              }
++
++              if (new_count > 0) {
++                raft::update_device(column_cache_new_indices.data(),
++                                    column_cache_new_indices_host.data(),
++                                    new_count,
++                                    stream);
++                raft::update_device(column_cache_new_delta.data(),
++                                    column_cache_new_delta_host.data(),
++                                    new_count,
++                                    stream);
++                if (use_bounded_column_cache) {
++                  raft::update_device(column_cache_new_slots.data(),
++                                      column_cache_new_slots_host.data(),
++                                      new_count,
++                                      stream);
++                }
++                float* cache_destination =
++                  use_fp16_persistent_cache || use_direct_slotted_float_cache
++                  ? nullptr
++                  : (use_bounded_column_cache
++                       ? column_cache_staging.data()
++                       : column_cache.data() + static_cast<size_t>(start_slot) * n_rows);
++                const bool use_fp16_tma_cache_materializer =
++                  use_fp16_persistent_cache || use_direct_slotted_float_cache ||
++                  (use_bounded_column_cache
++                     ? use_adaptive_fp16_tma_cache && new_count >= fp16_tma_cache_min_cols
++                     : new_count >= fp16_tma_cache_min_cols);
++                const bool use_fp16_tma_cublas_fallback =
++                  !use_fp16_persistent_cache && !use_direct_slotted_float_cache &&
++                  use_adaptive_fp16_tma_cache &&
++                  !use_fp16_tma_cache_materializer;
++                if (use_fp16_tma_cache_materializer || use_fp16_tma_cublas_fallback) {
++                  const int padded_cols = raft::ceildiv(new_count, 128) * 128;
++                  const int tile_count  = padded_cols / 128;
++                  fused_rbf::launch_fp16_tma_gather(fp16_tma_x.data(),
++                                               column_cache_new_indices.data(),
++                                               column_cache_new_delta.data(),
++                                               fused_norm_x.data(),
++                                               fp16_tma_ws.data(),
++                                               fp16_tma_norm_ws.data(),
++                                               fp16_tma_delta.data(),
++                                               new_count,
++                                               padded_cols,
++                                               fp16_tma_dim_padded,
++                                               stream);
++                  if (use_fp16_tma_cache_materializer) {
++                    const int fp16_tma_status = use_fp16_persistent_cache
++                      ? fp16_tma_rbf_materialize_slotted_half_cache(
++                          fp16_tma_contexts[tile_count - 1],
++                          fused_norm_x.data(),
++                          fp16_tma_norm_ws.data(),
++                          fp16_tma_delta.data(),
++                          column_cache_new_slots.data(),
++                          column_cache_fp16.data(),
++                          new_count,
++                          static_cast<float>(rbf_gamma),
++                          reinterpret_cast<void*>(stream))
++                      : (use_direct_slotted_float_cache
++                           ? fp16_tma_rbf_materialize_slotted_float_cache(
++                               fp16_tma_contexts[tile_count - 1],
++                               fused_norm_x.data(),
++                               fp16_tma_norm_ws.data(),
++                               fp16_tma_delta.data(),
++                               column_cache_new_slots.data(),
++                               column_cache.data(),
++                               new_count,
++                               static_cast<float>(rbf_gamma),
++                               reinterpret_cast<void*>(stream))
++                           : (use_bounded_column_cache
++                           ? fp16_tma_rbf_materialize_cache(
++                               fp16_tma_contexts[tile_count - 1],
++                               fused_norm_x.data(),
++                               fp16_tma_norm_ws.data(),
++                               fp16_tma_delta.data(),
++                               cache_destination,
++                               new_count,
++                               static_cast<float>(rbf_gamma),
++                               reinterpret_cast<void*>(stream))
++                           : fp16_tma_rbf_launch_cache(
++                               fp16_tma_contexts[tile_count - 1],
++                               fused_norm_x.data(),
++                               fp16_tma_norm_ws.data(),
++                               fp16_tma_delta.data(),
++                               cache_destination,
++                               fp16_tma_partial.data(),
++                               f.data(),
++                               new_count,
++                               static_cast<float>(rbf_gamma),
++                               reinterpret_cast<void*>(stream))));
++                    RAFT_CUDA_TRY(static_cast<cudaError_t>(fp16_tma_status));
++                    column_cache_fp16_tma_updates++;
++                    column_cache_fp16_tma_columns += new_count;
++                    fp16_tma_padded_total += padded_cols;
++                  } else {
++                    fused_rbf::column_cache::materialize_only_fp16_row_major(
++                      handle.get_cublas_handle(),
++                      fp16_tma_x.data(),
++                      fp16_tma_ws.data(),
++                      fused_norm_x.data(),
++                      fp16_tma_norm_ws.data(),
++                      cache_destination,
++                      n_rows,
++                      fp16_tma_dim_padded,
++                      new_count,
++                      static_cast<float>(rbf_gamma),
++                      stream);
++                    column_cache_fp16_fallback_updates++;
++                    column_cache_fp16_fallback_columns += new_count;
++                  }
++                } else {
++                  if (use_fp16_cache_materialization) {
++                    fused_rbf::column_cache::gather_fp16_working_set(
++                      column_cache_x_fp16.data(),
++                      column_cache_ws_fp16.data(),
++                      column_cache_new_indices.data(),
++                      n_rows,
++                      n_cols,
++                      new_count,
++                      stream);
++                  } else {
++                    ML::SVM::extractRows<math_t>(matrix,
++                                                 column_cache_ws.data(),
++                                                 column_cache_new_indices.data(),
++                                                 new_count,
++                                                 handle);
++                  }
++                  cache.selectValueSubset(column_cache_norm_ws.data(),
++                                          fused_norm_x.data(),
++                                          column_cache_new_indices.data(),
++                                          new_count);
++                  if (use_bounded_column_cache) {
++                    if (use_fp16_cache_materialization) {
++                      fused_rbf::column_cache::materialize_only_fp16(
++                        handle.get_cublas_handle(),
++                        column_cache_x_fp16.data(),
++                        column_cache_ws_fp16.data(),
++                        fused_norm_x.data(),
++                        column_cache_norm_ws.data(),
++                        cache_destination,
++                        n_rows,
++                        n_cols,
++                        new_count,
++                        static_cast<float>(rbf_gamma),
++                        stream);
++                      column_cache_fp16_updates++;
++                      column_cache_fp16_columns += new_count;
++                    } else {
++                      fused_rbf::column_cache::materialize_only(
++                        handle.get_cublas_handle(),
++                        getDenseData(matrix),
++                        column_cache_ws.data(),
++                        fused_norm_x.data(),
++                        column_cache_norm_ws.data(),
++                        cache_destination,
++                        n_rows,
++                        n_cols,
++                        new_count,
++                        static_cast<float>(rbf_gamma),
++                        use_fp32_cache_materialization ? CUBLAS_COMPUTE_32F
++                                                       : CUBLAS_COMPUTE_32F_FAST_TF32,
++                        stream);
++                    }
++                    if (use_fp32_cache_materialization &&
++                        !use_fp16_cache_materialization) {
++                      column_cache_fp32_updates++;
++                      column_cache_fp32_columns += new_count;
++                    }
++                  } else {
++                    fused_rbf::column_cache::materialize(
++                      handle.get_cublas_handle(),
++                      getDenseData(matrix),
++                      column_cache_ws.data(),
++                      fused_norm_x.data(),
++                      column_cache_norm_ws.data(),
++                      column_cache_new_delta.data(),
++                      f.data(),
++                      cache_destination,
++                      n_rows,
++                      n_cols,
++                      new_count,
++                      static_cast<float>(rbf_gamma),
++                      stream);
++                  }
++                }
++                if (use_bounded_column_cache && !use_fp16_persistent_cache &&
++                    !use_direct_slotted_float_cache) {
++                  fused_rbf::column_cache::scatter(column_cache_staging.data(),
++                                                   column_cache.data(),
++                                                   column_cache_new_slots.data(),
++                                                   n_rows,
++                                                   new_count,
++                                                   stream);
++                }
++              }
++              const int apply_count = use_bounded_column_cache ? nnz_da : hit_count;
++              if (use_bounded_column_cache) {
++                for (int column = 0; column < nnz_da; ++column) {
++                  const int index = column_cache_active_indices[column];
++                  const int slot  = column_cache_slot_of[index];
++                  if (slot < 0) {
++                    throw std::runtime_error(
++                      "Bounded SMO column cache lost an active column mapping");
++                  }
++                  column_cache_hit_slots_host[column] = slot;
++                  column_cache_hit_delta_host[column] = column_cache_active_delta[column];
++                }
++              }
++              if (apply_count > 0) {
++                raft::update_device(column_cache_hit_slots.data(),
++                                    column_cache_hit_slots_host.data(),
++                                    apply_count,
++                                    stream);
++                raft::update_device(column_cache_hit_delta.data(),
++                                    column_cache_hit_delta_host.data(),
++                                    apply_count,
++                                    stream);
++                if (use_bounded_column_cache) {
++                  if (use_fp16_persistent_cache) {
++                    fused_rbf::column_cache::apply_tiled_order_fp16(
++                      column_cache_fp16.data(),
++                      column_cache_hit_slots.data(),
++                      column_cache_hit_delta.data(),
++                      f.data(),
++                      n_rows,
++                      apply_count,
++                      stream);
++                  } else {
++                    fused_rbf::column_cache::apply_tiled_order(
++                      column_cache.data(),
++                      column_cache_hit_slots.data(),
++                      column_cache_hit_delta.data(),
++                      f.data(),
++                      n_rows,
++                      apply_count,
++                      stream);
++                  }
++                } else {
++                  fused_rbf::column_cache::apply(column_cache.data(),
++                                                 column_cache_hit_slots.data(),
++                                                 column_cache_hit_delta.data(),
++                                                 f.data(),
++                                                 n_rows,
++                                                 apply_count,
++                                                 stream);
++                }
++              }
++              column_cache_new_total += new_count;
++              column_cache_hit_total += hit_count;
++            } else {
++              const int padded_cols = raft::ceildiv(nnz_da, 128) * 128;
++              const int tile_count  = padded_cols / 128;
++              {
++                raft::common::nvtx::range<> gather_stage{"SmoSolver::fp16_tma_gather"};
++                fused_rbf::launch_fp16_tma_gather(fp16_tma_x.data(),
++                                             nz_da_idx.data(),
++                                             nz_da.data(),
++                                             fused_norm_x.data(),
++                                             fp16_tma_ws.data(),
++                                             fp16_tma_norm_ws.data(),
++                                             fp16_tma_delta.data(),
++                                             nnz_da,
++                                             padded_cols,
++                                             fp16_tma_dim_padded,
++                                             stream);
++              }
++              const int fp16_tma_status = fp16_tma_rbf_launch(fp16_tma_contexts[tile_count - 1],
++                                                    fused_norm_x.data(),
++                                                    fp16_tma_norm_ws.data(),
++                                                    fp16_tma_delta.data(),
++                                                    f.data(),
++                                                    fp16_tma_partial.data(),
++                                                    f.data(),
++                                                    static_cast<float>(rbf_gamma),
++                                                    reinterpret_cast<void*>(stream));
++              RAFT_CUDA_TRY(static_cast<cudaError_t>(fp16_tma_status));
++              fp16_tma_padded_total += padded_cols;
++            }
++          } else {
++            ML::SVM::extractRows<math_t>(
++              matrix, fused_ws.data(), nz_da_idx.data(), nnz_da, handle);
++            cache.selectValueSubset(
++              fused_norm_ws.data(), fused_norm_x.data(), nz_da_idx.data(), nnz_da);
++          }
++          if (use_direct_fused) {
++            fused_rbf::launch(getDenseData(matrix),
++                              fused_ws.data(),
++                              fused_norm_x.data(),
++                              fused_norm_ws.data(),
++                              nz_da.data(),
++                              f.data(),
++                              n_rows,
++                              nnz_da,
++                              static_cast<float>(rbf_gamma),
++                              stream);
++          } else if (use_tiled_fused) {
++            fused_rbf::launch_tiled(handle.get_cublas_handle(),
++                                    getDenseData(matrix),
++                                    fused_ws.data(),
++                                    fused_norm_x.data(),
++                                    fused_norm_ws.data(),
++                                    nz_da.data(),
++                                    f.data(),
++                                    fused_panel.data(),
++                                    n_rows,
++                                    n_cols,
++                                    nnz_da,
++                                    fused_tile_rows,
++                                    static_cast<float>(rbf_gamma),
++                                    stream);
++          }
++          cache.FinishWorkingSetWithoutBatching();
++          fused_updates++;
++          fused_nnz_total += nnz_da;
++          RAFT_CUDA_TRY(cudaPeekAtLastError());
++          update_completed = true;
++        }
++      }
++      if (!update_completed) {
++        auto batch_descriptor = cache.InitFullTileBatching(nz_da_idx.data(), nnz_da);
++
++        while (cache.getNextBatchKernel(batch_descriptor)) {
++          raft::common::nvtx::range<> stage{"SmoSolver::gradient_update"};
++          // do (partial) update
++          UpdateF(f.data() + batch_descriptor.offset,
++                  batch_descriptor.batch_size,
++                  nz_da.data(),
++                  nnz_da,
++                  batch_descriptor.kernel_data);
++          RAFT_CUDA_TRY(cudaPeekAtLastError());
++        }
++        if (fp16_tma_repair_mode) { repair_updates++; }
+       }
+     }
+-    handle.sync_stream(stream);
+-    raft::common::nvtx::pop_range();
+-    raft::common::nvtx::pop_range();  // ("SmoSolver::UpdateF");
+-
+-    math_t diff = host_return_buff[0];
+-    keep_going  = CheckStoppingCondition(diff);
+-    n_iter += host_return_buff[1];
+-    n_outer_iter++;
+-    if ((max_iter != -1 && n_iter >= max_iter) || n_outer_iter >= max_outer_iter) {
+-      keep_going = false;
++    {
++      raft::common::nvtx::range<> stage{"SmoSolver::iteration_sync"};
++      handle.sync_stream(stream);
+     }
++    if (trace_state_this_iteration) {
++      raft::update_host(
++        trace_f_before_host.data(), trace_f_before.data(), n_train, stream);
++      raft::update_host(trace_f_after_host.data(), f.data(), n_train, stream);
++      raft::update_host(trace_alpha_after_host.data(), alpha.data(), n_train, stream);
++      handle.sync_stream(stream);
++      auto write_state = [&](const char* suffix, const std::vector<math_t>& values) {
++        const std::string path = trace_state_prefix + suffix;
++        std::ofstream output(path, std::ios::out | std::ios::binary | std::ios::trunc);
++        if (!output.is_open()) {
++          throw std::runtime_error("Unable to open SMO trace state file: " + path);
++        }
++        output.write(reinterpret_cast<const char*>(values.data()),
++                     static_cast<std::streamsize>(values.size() * sizeof(math_t)));
++        if (!output.good()) {
++          throw std::runtime_error("Unable to write SMO trace state file: " + path);
++        }
++      };
++      write_state(".f_before.bin", trace_f_before_host);
++      write_state(".f_after.bin", trace_f_after_host);
++      write_state(".alpha_after.bin", trace_alpha_after_host);
++    }
++
++    {
++      raft::common::nvtx::range<> stage{"SmoSolver::convergence_check"};
++      math_t diff = host_return_buff[0];
++      if (trace_enabled) {
++        trace_stream << "{\"type\":\"iter\",\"iter\":" << n_outer_iter
++                     << ",\"gap\":" << static_cast<double>(diff)
++                     << ",\"inner\":" << static_cast<long long>(host_return_buff[1])
++                     << ",\"selected\":[";
++        for (int i = 0; i < n_ws; ++i) {
++          if (i != 0) { trace_stream << ','; }
++          trace_stream << trace_selected[i];
++        }
++        trace_stream << "],\"ws\":[";
++        for (int i = 0; i < n_ws; ++i) {
++          if (i != 0) { trace_stream << ','; }
++          trace_stream << trace_ws[i];
++        }
++        trace_stream << "],\"idx\":[";
++        for (int i = 0; i < nnz_da; ++i) {
++          if (i != 0) { trace_stream << ','; }
++          trace_stream << trace_idx[i];
++        }
++        trace_stream << "],\"delta\":[";
++        for (int i = 0; i < nnz_da; ++i) {
++          if (i != 0) { trace_stream << ','; }
++          trace_stream << static_cast<double>(trace_da[i]);
++        }
++        trace_stream << ']';
++        if (trace_state_this_iteration) {
++          trace_stream << ",\"state_prefix\":\"" << trace_state_prefix << '"';
++        }
++        trace_stream << "}\n";
++      }
++      keep_going  = CheckStoppingCondition(diff);
++      if (repair_started_this_iteration) { keep_going = true; }
++      n_iter += host_return_buff[1];
++      n_outer_iter++;
++      if ((max_iter != -1 && n_iter >= max_iter) || n_outer_iter >= max_outer_iter) {
++        keep_going = false;
++      }
++
++      if (n_outer_iter % 500 == 0) {
++        CUML_LOG_DEBUG("SMO iteration %d, diff %lf", n_outer_iter, (double)diff);
++      }
++    }
++  }
++
++  if (trace_enabled) {
++    trace_stream.flush();
++    std::cerr << "CUML_SMO_TRACE path=" << trace_path_env << " iterations=" << n_outer_iter
++              << std::endl;
++  }
+ 
+-    if (n_outer_iter % 500 == 0) {
+-      CUML_LOG_DEBUG("SMO iteration %d, diff %lf", n_outer_iter, (double)diff);
++  if (persist_block_tile_configured && persist_block_tile_bytes > 0) {
++    cudaStreamAttrValue attribute{};
++    attribute.accessPolicyWindow.num_bytes = 0;
++    RAFT_CUDA_TRY(cudaStreamSetAttribute(
++      stream, cudaStreamAttributeAccessPolicyWindow, &attribute));
++    RAFT_CUDA_TRY(cudaDeviceSetLimit(cudaLimitPersistingL2CacheSize, 0));
++  }
++
++  if (use_overlap_prefetch) {
++    RAFT_CUDA_TRY(cudaStreamSynchronize(column_cache_prefetch_stream));
++    RAFT_CUDA_TRY(cudaEventDestroy(column_cache_prefetch_plan_ready));
++    RAFT_CUDA_TRY(cudaEventDestroy(column_cache_prefetch_start));
++    RAFT_CUDA_TRY(cudaEventDestroy(column_cache_prefetch_done));
++    RAFT_CUDA_TRY(cudaStreamDestroy(column_cache_prefetch_stream));
++    RAFT_CUDA_TRY(cudaFreeHost(column_cache_prefetch_ws_host));
++  }
++
++  if (use_fp16_tma) {
++    for (int tile_count = 1; tile_count <= fp16_tma_max_tiles; ++tile_count) {
++      fp16_tma_rbf_destroy_context(fp16_tma_contexts[tile_count - 1]);
++    }
++    if (fp16_coherent_tile_context != nullptr) {
++      fp16_tma_rbf_destroy_context(fp16_coherent_tile_context);
+     }
+   }
+ 
++  const char* fused_stats_env = std::getenv("CUML_SVM_FUSED_RBF_STATS");
++  if (fused_stats_env != nullptr && std::string(fused_stats_env) == "1") {
++    const char* fused_mode = "none";
++    if (use_column_cache) {
++      if (use_bounded_column_cache) {
++        if (use_fp16_persistent_cache) {
++          fused_mode = "column_cache_bounded_lru_persistent_fp16";
++        } else if (use_direct_slotted_float_cache) {
++          fused_mode = "column_cache_bounded_lru_direct_fp32";
++        } else if (use_fp16_cache_materialization) {
++          fused_mode = "column_cache_bounded_lru_fp16";
++        } else {
++          fused_mode = use_fp16_tma_repair ? "column_cache_bounded_lru_repair"
++                                      : "column_cache_bounded_lru";
++        }
++      } else if (use_overlap_prefetch) {
++        fused_mode = use_fp16_tma_repair ? "column_cache_overlap_repair"
++                                    : "column_cache_overlap";
++      } else {
++        fused_mode = use_fp16_tma_repair ? "column_cache_fp16_tma_hybrid_repair"
++                                    : "column_cache_fp16_tma_hybrid";
++      }
++    } else if (use_fp16_tma_repair) {
++      fused_mode = "fp16_tma_sm120_repair";
++    } else if (use_fp16_tma) {
++      fused_mode = "fp16_tma_sm120";
++    } else if (use_direct_fused) {
++      fused_mode = "d18";
++    } else if (use_tiled_fused) {
++      fused_mode = "tiled_tf32";
++    }
++    const size_t cache_element_bytes =
++      use_fp16_persistent_cache ? sizeof(__half) : sizeof(float);
++    const size_t cache_allocated_bytes = use_column_cache
++      ? static_cast<size_t>(column_cache_capacity) * n_rows * cache_element_bytes
++      : 0;
++    const size_t dot_panel_bytes = fused_panel.size() * sizeof(math_t);
++    const size_t staging_bytes = column_cache_staging.size() * sizeof(float);
++    std::cerr << "CUML_FUSED_RBF_STATS updates=" << fused_updates
++              << " outer_iterations=" << n_outer_iter
++              << " final_diff=" << static_cast<double>(diff_prev)
++              << " nnz_total=" << fused_nnz_total
++              << " padded_total=" << fp16_tma_padded_total
++              << " requested=" << (fused_requested || fp16_tma_requested)
++              << " supported=" << use_fused << " mode=" << fused_mode
++              << " tile_rows=" << fused_tile_rows
++              << " dim_padded=" << fp16_tma_dim_padded
++              << " repair_refreshes=" << repair_refreshes
++              << " repair_supports=" << repair_supports
++              << " repair_updates=" << repair_updates
++              << " column_cache_capacity=" << column_cache_capacity
++              << " cache_element_bytes=" << cache_element_bytes
++              << " cache_allocated_bytes=" << cache_allocated_bytes
++              << " dot_panel_bytes=" << dot_panel_bytes
++              << " staging_bytes=" << staging_bytes
++              << " column_cache_slots=" << column_cache_next_slot
++              << " column_cache_new=" << column_cache_new_total
++              << " column_cache_hits=" << column_cache_hit_total
++              << " column_cache_evictions=" << column_cache_evictions
++              << " column_cache_fp16_tma_updates=" << column_cache_fp16_tma_updates
++              << " column_cache_fp16_tma_columns=" << column_cache_fp16_tma_columns
++              << " column_cache_fp32_updates=" << column_cache_fp32_updates
++              << " column_cache_fp32_columns=" << column_cache_fp32_columns
++              << " column_cache_fp16_updates=" << column_cache_fp16_updates
++              << " column_cache_fp16_columns=" << column_cache_fp16_columns
++              << " column_cache_fp16_fallback_updates="
++              << column_cache_fp16_fallback_updates
++              << " column_cache_fp16_fallback_columns="
++              << column_cache_fp16_fallback_columns
++              << " cache_materialize_fp32=" << use_fp32_cache_materialization
++              << " cache_materialize_fp16=" << use_fp16_cache_materialization
++              << " persistent_cache_fp16=" << use_fp16_persistent_cache
++              << " coherent_fp16_tile=" << use_fp16_coherent_tile
++              << " direct_slotted_float_cache=" << use_direct_slotted_float_cache
++              << " column_cache_columns_requested=" << requested_cache_columns
++              << " column_cache_fp16_tma_min_cols=" << fp16_tma_cache_min_cols
++              << " column_cache_prefetch_updates=" << column_cache_prefetch_updates
++              << " column_cache_prefetch_columns=" << column_cache_prefetch_columns
++              << " bounded_cache=" << use_bounded_column_cache
++              << " overlap_prefetch=" << use_overlap_prefetch
++              << " persist_block_tile=" << use_persist_block_tile
++              << " persist_block_tile_bytes=" << persist_block_tile_bytes << std::endl;
++  }
++
+   CUML_LOG_DEBUG(
+     "SMO solver finished after %d outer iterations, total inner %d"
+     " iterations, and diff %lf",
+@@ -216,11 +1445,14 @@ void SmoSolver<math_t>::Solve(MatrixViewType matrix,
+     n_iter,
+     diff_prev);
+ 
+-  Results<math_t, MatrixViewType> res(
+-    handle, matrix, n_rows, n_cols, y, C_vec.data(), svmType, is_precomputed);
+-  res.Get(alpha.data(), f.data(), dual_coefs, n_support, idx, support_matrix, b);
++  {
++    raft::common::nvtx::range<> stage{"SmoSolver::finalize_model"};
++    Results<math_t, MatrixViewType> res(
++      handle, matrix, n_rows, n_cols, y, C_vec.data(), svmType, is_precomputed);
++    res.Get(alpha.data(), f.data(), dual_coefs, n_support, idx, support_matrix, b);
+ 
+-  ReleaseBuffers();
++    ReleaseBuffers();
++  }
+ }
+ 
+ /**
+diff --git a/cpp/src/svm/smosolver.h b/cpp/src/svm/smosolver.h
+index fe13ffe..ced7a0e 100644
+--- a/cpp/src/svm/smosolver.h
++++ b/cpp/src/svm/smosolver.h
+@@ -62,13 +62,15 @@ class SmoSolver {
+             SvmParameter param,
+             cuvs::distance::kernels::KernelType kernel_type,
+             cuvs::distance::kernels::GramMatrixBase<math_t>* kernel,
+-            bool is_precomputed = false)
++            bool is_precomputed = false,
++            math_t rbf_gamma    = math_t{0})
+     : handle(handle),
+       C(param.C),
+       tol(param.tol),
+       kernel(kernel),
+       kernel_type(kernel_type),
+       is_precomputed(is_precomputed),
++      rbf_gamma(rbf_gamma),
+       cache_size(param.cache_size),
+       nochange_steps(param.nochange_steps),
+       epsilon(param.epsilon),
+@@ -253,6 +255,7 @@ class SmoSolver {
+   cuvs::distance::kernels::GramMatrixBase<math_t>* kernel;
+   cuvs::distance::kernels::KernelType kernel_type;
+   bool is_precomputed;  //!< if true, input is a precomputed kernel matrix
++  math_t rbf_gamma;     //!< RBF gain passed through from KernelParams
+   float cache_size;     //!< size of kernel cache in MiB
+ 
+   SvmType svmType;  ///!< Type of the SVM problem to solve
+diff --git a/cpp/src/svm/svr_impl.cuh b/cpp/src/svm/svr_impl.cuh
+index 09c2770..85fc1ee 100644
+--- a/cpp/src/svm/svr_impl.cuh
++++ b/cpp/src/svm/svr_impl.cuh
+@@ -63,7 +63,12 @@ int svrFitX(const raft::handle_t& handle,
+     kernel = cuvs::distance::kernels::KernelFactory<math_t>::create(cuvs_params);
+   }
+ 
+-  SmoSolver<math_t> smo(handle_impl, param, cuvs_params.kernel, kernel, is_precomputed);
++  SmoSolver<math_t> smo(handle_impl,
++                        param,
++                        cuvs_params.kernel,
++                        kernel,
++                        is_precomputed,
++                        static_cast<math_t>(kernel_params.gamma));
+   smo.Solve(matrix,
+             n_rows,
+             n_cols,
+diff --git a/cpp/src/svm/workingset.cuh b/cpp/src/svm/workingset.cuh
+index b6ec44f..cd56c13 100644
+--- a/cpp/src/svm/workingset.cuh
++++ b/cpp/src/svm/workingset.cuh
+@@ -254,7 +254,6 @@ inline int WorkingSet<math_t>::GatherAvailable(int n_already_selected,
+                              n_train,
+                              stream);
+   int n_selected = d_num_selected.value(stream);
+-  handle.sync_stream(stream);
+ 
+   // Copy to output
+   int n_copy = n_selected > n_needed ? n_needed : n_selected;
+@@ -303,7 +302,6 @@ inline int WorkingSet<math_t>::SelectPrevWs(int n_needed, int n_already_selected
+                         op,
+                         stream);
+   int n_selected = d_num_selected.value(stream);
+-  handle.sync_stream(stream);
+   int n_copy = n_selected < n_needed ? n_selected : n_needed;
+   raft::copy(idx.data() + n_already_selected, ws_idx_selected.data(), n_copy, stream);
+   return n_copy;

@@ -1,0 +1,15 @@
+{
+  "config_id": "smoke-synthetic",
+  "hardware": "NVIDIA RTX PRO 6000 Blackwell Server Edition",
+  "backend": "portable-cublas-reference",
+  "status": "passed",
+  "checks": {
+    "build_completed": true,
+    "explicit_rbf_oracle_tests_passed": true,
+    "direct_fp32_fit_status_zero": true,
+    "coherent_fp16_fit_status_zero": true,
+    "finite_outputs": true,
+    "held_out_quality_pipeline_passed": true
+  },
+  "boundary": "Single-run integration smoke; not performance evidence."
+}

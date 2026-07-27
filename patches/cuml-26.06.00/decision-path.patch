@@ -1,0 +1,84 @@
+diff --git a/cpp/src/svm/smoblocksolve.cuh b/cpp/src/svm/smoblocksolve.cuh
+index 01b8946..ab2733d 100644
+--- a/cpp/src/svm/smoblocksolve.cuh
++++ b/cpp/src/svm/smoblocksolve.cuh
+@@ -18,10 +18,33 @@
+ 
+ #include <selection/kselection.cuh>
+ #include <stdlib.h>
++#include <type_traits>
+ 
+ namespace ML {
+ namespace SVM {
+ 
++template <typename math_t>
++__device__ __forceinline__ math_t smo_fast_divide(math_t numerator, math_t denominator)
++{
++  if constexpr (std::is_same_v<math_t, float>) {
++    return __fdividef(numerator, denominator);
++  } else {
++    return numerator / denominator;
++  }
++}
++
++template <typename math_t, int ITEMS_PER_THREAD>
++__device__ __forceinline__ math_t smo_load_register_item(
++  const math_t (&values)[ITEMS_PER_THREAD], int selected)
++{
++  math_t value = math_t{0};
++#pragma unroll
++  for (int item = 0; item < ITEMS_PER_THREAD; ++item) {
++    if (selected == item) { value = values[item]; }
++  }
++  return value;
++}
++
+ /**
+  * @brief Solve the optimization problem for the actual working set.
+  *
+@@ -385,7 +408,7 @@ CUML_KERNEL __launch_bounds__(TPB) void SmoBlockSolveCoarsened(math_t* y_array,
+           in_lower(local_a[item], local_y[item], local_C[item])) {
+         const math_t eta = max(Kd[pos] + Kd[u] - math_t{2} * local_Kui[item], ETA_EPS);
+         const math_t residual = f_u - local_f[item];
+-        const math_t score    = residual * residual / eta;
++        const math_t score    = smo_fast_divide(residual * residual, eta);
+         if (score > lower_best.val) { lower_best = Pair{score, pos}; }
+       }
+     }
+@@ -393,17 +416,25 @@ CUML_KERNEL __launch_bounds__(TPB) void SmoBlockSolveCoarsened(math_t* y_array,
+     if (tid == 0) { l = result.key; }
+     __syncthreads();
+ 
+-#pragma unroll
+-    for (int item = 0; item < ITEMS_PER_THREAD; ++item) {
+-      const int pos = tid + item * TPB;
+-      if (pos == u) {
+-        tmp_u = local_y[item] > 0 ? local_C[item] - local_a[item] : local_a[item];
+-      }
+-      if (pos == l) {
+-        const math_t eta = max(Kd[u] + Kd[l] - math_t{2} * local_Kui[item], ETA_EPS);
+-        tmp_l = local_y[item] > 0 ? local_a[item] : local_C[item] - local_a[item];
+-        tmp_l = min(tmp_l, (local_f[item] - f_u) / eta);
+-      }
++    const int u_owner = u % TPB;
++    const int l_owner = l % TPB;
++    if (tid == u_owner) {
++      const int item = u / TPB;
++      const math_t a = smo_load_register_item(local_a, item);
++      const math_t y = smo_load_register_item(local_y, item);
++      const math_t c = smo_load_register_item(local_C, item);
++      tmp_u          = y > 0 ? c - a : a;
++    }
++    if (tid == l_owner) {
++      const int item  = l / TPB;
++      const math_t a  = smo_load_register_item(local_a, item);
++      const math_t y  = smo_load_register_item(local_y, item);
++      const math_t c  = smo_load_register_item(local_C, item);
++      const math_t f  = smo_load_register_item(local_f, item);
++      const math_t Kui = smo_load_register_item(local_Kui, item);
++      const math_t eta = max(Kd[u] + Kd[l] - math_t{2} * Kui, ETA_EPS);
++      tmp_l            = y > 0 ? a : c - a;
++      tmp_l            = min(tmp_l, (f - f_u) / eta);
+     }
+     __syncthreads();
+     const math_t q = min(tmp_u, tmp_l);

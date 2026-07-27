@@ -1,0 +1,12 @@
+build/
+dist/
+results/
+.venv/
+__pycache__/
+*.egg-info/
+*.so
+*.ncu-rep
+*.nsys-rep
+*.npz
+*.npy
+

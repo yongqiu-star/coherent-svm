@@ -1,0 +1,24 @@
+id = "ember65k-ab"
+
+[dataset]
+id = "ember2018-probe65k"
+kind = "prepared"
+relative_path = "ember2018/probe-65536"
+rows = 65536
+dim = 2381
+
+[experiment]
+methods = ["direct_fp32", "coherent_fp16"]
+repeats = 7
+schedule = "balanced"
+
+[solver]
+c = 1.0
+tol = 1e-3
+max_iter = 60000
+working_set_size = 1024
+cache_columns = 32768
+cache_size_mib = 1024
+
+[evaluation]
+rows = 65536
