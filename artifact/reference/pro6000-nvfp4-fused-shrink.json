@@ -1,0 +1,70 @@
+{
+  "workload": {
+    "dataset": "EMBER 2018 official 600K standardized F32 + 64 zero-weight padding rows",
+    "solver_shape": [600064, 2381],
+    "dummy_support_count": 0,
+    "C": 1.0,
+    "gamma": 0.00041999160016799666,
+    "tol": 0.001,
+    "working_set": 1024,
+    "eval_subset": "balanced 8192 (4096 per class, same8192)"
+  },
+  "hardware": "NVIDIA RTX PRO 6000 Blackwell Server Edition (sm_120a, NUMA-0 pinned)",
+  "backend": "sm120_nvfp4_rbf_fused_kernel + coherent active-set shrinking (v10h source excluded per NOTICE)",
+  "ember600k_6round_paired": {
+    "stock_cuml_fp32_64g_ref": {
+      "median_fit_seconds": 15.4451,
+      "n_support": 125576,
+      "fp32_accuracy": 0.93896,
+      "fp32_auc": 0.98274
+    },
+    "keeper_nvfp4_c32768": {
+      "median_fit_seconds": 4.1524,
+      "min_fit_seconds": 4.0973,
+      "max_fit_seconds": 4.1746,
+      "n_iter": 484370,
+      "n_support": 125732,
+      "matched_nvfp4_accuracy": 0.93616,
+      "matched_nvfp4_auc": 0.98193
+    },
+    "fused_nvfp4_scale6_c32768": {
+      "median_fit_seconds": 3.2852,
+      "min_fit_seconds": 3.2599,
+      "max_fit_seconds": 3.4316,
+      "speedup_vs_keeper": 1.2640,
+      "speedup_vs_stock64g": 4.7014,
+      "n_iter": 412525,
+      "n_support": 125492,
+      "matched_nvfp4_accuracy": 0.93787,
+      "matched_nvfp4_auc": 0.98340
+    },
+    "fused_nvfp4_shrink_gap025_margin050_c32768": {
+      "median_fit_seconds": 2.8242,
+      "min_fit_seconds": 2.7969,
+      "max_fit_seconds": 2.8450,
+      "speedup_vs_fused": 1.1632,
+      "speedup_vs_keeper": 1.4703,
+      "speedup_vs_stock64g": 5.4688,
+      "shrink_iter": 748,
+      "shrink_active_rows": 162556,
+      "unshrink_iter": 1369,
+      "polish_iters": 0,
+      "n_iter": 402511,
+      "n_support": 125625,
+      "matched_nvfp4_accuracy": 0.93787,
+      "matched_nvfp4_auc": 0.98341
+    },
+    "fused_nvfp4_shrink_gap025_margin050_c65536": {
+      "median_fit_seconds": 2.8274,
+      "min_fit_seconds": 2.7952,
+      "max_fit_seconds": 2.8318,
+      "n_iter": 402511,
+      "n_support": 125625
+    }
+  },
+  "ember65k_3round_after_warmup": {
+    "keeper_65k": { "median_fit_seconds": 0.3729, "n_support": 18881 },
+    "fused_65k":  { "median_fit_seconds": 0.3606, "n_support": 18723 },
+    "shrink_65k": { "median_fit_seconds": 0.3681, "n_support": 18737 }
+  }
+}

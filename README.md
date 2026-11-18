@@ -184,6 +184,36 @@ sampled accuracy. `checks.json` records completion, fit status, and finite
 timing. These files deliberately exclude hostnames, usernames, GPU UUIDs,
 private remotes, and absolute paths.
 
+## Coherent NVFP4 Fused Epilogue & Active-Set Shrinking
+
+Building on the coherent FP16 design, `patches/cuml-26.06.00/coherent-nvfp4-fused-shrink.patch`
+and `src/nvfp4/` add:
+
+1. **Full-range NVFP4 E2M1 block scaling (`scale6`)**: scales 64-element blocks by
+   `max_abs / 6.0f` instead of `max_abs / 4.0f` to utilize the `±6.0` E2M1 level.
+2. **Coherent fused SM120 NVFP4 MMA + FP32 RBF epilogue (`sm120_nvfp4_rbf_fused_kernel`)**:
+   eliminates intermediate BF16 dot-panel global memory round-trips for **both**
+   `K[X,W]` and `K[W,W]` (preserving strict cross-view operator coherence) with
+   row-bounds guards for arbitrary non-128-multiple subcontexts.
+3. **Coherent Active-Set Shrinking (`CUML_SVM_COHERENT_SHRINK=1`)**:
+   gathers active packed E2M1 rows and E4M3 scales into a compact GPU subcontext
+   (`coherent_nvfp4_create_subcontext`) once the KKT gap narrows (`CUML_SVM_SHRINK_GAP=0.25`,
+   `CUML_SVM_SHRINK_MARGIN=0.50`), expands effective LRU cache capacity in the shrunk
+   space, and performs exact changed-column `f` reconstruction + global KKT verification
+   on unshrink.
+
+Reference 6-round paired medians on NVIDIA RTX PRO 6000 Blackwell (`sm_120a`,
+Full EMBER `600,000 x 2,381`, `tol=0.001`, matched NVFP4 `same8192` evaluation; see
+`artifact/reference/pro6000-nvfp4-fused-shrink.json`):
+
+- Stock cuML FP32 (64 GiB cache reference): `15.4451 s`
+- Keeper Coherent NVFP4 (`c=32768`): `4.1524 s` (`0.93616` acc, `0.98193` AUC)
+- Fused + `scale6` NVFP4 (`c=32768`): `3.2852 s` (`1.264x` vs keeper, `0.93787` acc, `0.98340` AUC)
+- **Fused + Coherent Shrinking (`c=32768`)**: **`2.8242 s`** (`1.470x` vs keeper, **`5.469x`** vs stock, `0.93787` acc, `0.98341` AUC)
+
+(Consistent with `NOTICE`, the external `v10h` mainloop `.cu` supplied via
+`COHERENT_NVFP4_V10H_SOURCE` is not redistributed in this repository.)
+
 ## Numerical claim boundary
 
 The coherent solver reaches its declared low-precision stopping criterion and

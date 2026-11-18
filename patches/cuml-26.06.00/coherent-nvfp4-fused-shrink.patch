@@ -1,0 +1,1430 @@
+diff --git a/cpp/src/svm/smoblocksolve.cuh b/cpp/src/svm/smoblocksolve.cuh
+index bea590f..8867945 100644
+--- a/cpp/src/svm/smoblocksolve.cuh
++++ b/cpp/src/svm/smoblocksolve.cuh
+@@ -22,6 +22,28 @@
+ namespace ML {
+ namespace SVM {
+ 
++template <typename math_t>
++__device__ __forceinline__ math_t smo_fast_divide(math_t numerator, math_t denominator)
++{
++  if constexpr (std::is_same_v<math_t, float>) {
++    return __fdividef(numerator, denominator);
++  } else {
++    return numerator / denominator;
++  }
++}
++
++template <typename math_t, int ITEMS_PER_THREAD>
++__device__ __forceinline__ math_t smo_load_register_item(
++  const math_t (&values)[ITEMS_PER_THREAD], int selected)
++{
++  math_t value = math_t{0};
++#pragma unroll
++  for (int item = 0; item < ITEMS_PER_THREAD; ++item) {
++    if (selected == item) { value = values[item]; }
++  }
++  return value;
++}
++
+ /**
+  * @brief Solve the optimization problem for the actual working set.
+  *
+@@ -393,17 +415,25 @@ CUML_KERNEL __launch_bounds__(TPB) void SmoBlockSolveCoarsened(math_t* y_array,
+     if (tid == 0) { l = result.key; }
+     __syncthreads();
+ 
+-#pragma unroll
+-    for (int item = 0; item < ITEMS_PER_THREAD; ++item) {
+-      const int pos = tid + item * TPB;
+-      if (pos == u) {
+-        tmp_u = local_y[item] > 0 ? local_C[item] - local_a[item] : local_a[item];
+-      }
+-      if (pos == l) {
+-        const math_t eta = max(Kd[u] + Kd[l] - math_t{2} * local_Kui[item], ETA_EPS);
+-        tmp_l = local_y[item] > 0 ? local_a[item] : local_C[item] - local_a[item];
+-        tmp_l = min(tmp_l, (local_f[item] - f_u) / eta);
+-      }
++    const int u_owner = u % TPB;
++    const int l_owner = l % TPB;
++    if (tid == u_owner) {
++      const int item = u / TPB;
++      const math_t a = smo_load_register_item(local_a, item);
++      const math_t y = smo_load_register_item(local_y, item);
++      const math_t c = smo_load_register_item(local_C, item);
++      tmp_u          = y > 0 ? c - a : a;
++    }
++    if (tid == l_owner) {
++      const int item   = l / TPB;
++      const math_t a   = smo_load_register_item(local_a, item);
++      const math_t y   = smo_load_register_item(local_y, item);
++      const math_t c   = smo_load_register_item(local_C, item);
++      const math_t f   = smo_load_register_item(local_f, item);
++      const math_t Kui = smo_load_register_item(local_Kui, item);
++      const math_t eta = max(Kd[u] + Kd[l] - math_t{2} * Kui, ETA_EPS);
++      tmp_l            = y > 0 ? a : c - a;
++      tmp_l            = min(tmp_l, (f - f_u) / eta);
+     }
+     __syncthreads();
+     const math_t q = min(tmp_u, tmp_l);
+diff --git a/cpp/src/svm/smosolver.cuh b/cpp/src/svm/smosolver.cuh
+index 24d0853..27e87d8 100644
+--- a/cpp/src/svm/smosolver.cuh
++++ b/cpp/src/svm/smosolver.cuh
+@@ -59,6 +59,166 @@
+ namespace ML {
+ namespace SVM {
+ 
++namespace coherent_shrink {
++
++template <typename math_t, int TPB = 256>
++CUML_KERNEL void compute_kkt_bounds_stage1(const math_t* __restrict__ alpha,
++                                           const math_t* __restrict__ y,
++                                           const math_t* __restrict__ C_vec,
++                                           const math_t* __restrict__ f,
++                                           int n,
++                                           math_t* __restrict__ block_min_up,
++                                           math_t* __restrict__ block_max_low)
++{
++  using BlockReduce = cub::BlockReduce<math_t, TPB>;
++  __shared__ typename BlockReduce::TempStorage temp_up;
++  __shared__ typename BlockReduce::TempStorage temp_low;
++
++  math_t local_min_up  = INFINITY;
++  math_t local_max_low = -INFINITY;
++  for (int i = blockIdx.x * TPB + threadIdx.x; i < n; i += gridDim.x * TPB) {
++    const math_t Ci = C_vec[i];
++    if (Ci > math_t{0}) {
++      const math_t ai = alpha[i];
++      const math_t yi = y[i];
++      const math_t fi = f[i];
++      if (in_upper(ai, yi, Ci) && fi < local_min_up) { local_min_up = fi; }
++      if (in_lower(ai, yi, Ci) && fi > local_max_low) { local_max_low = fi; }
++    }
++  }
++  const math_t min_up = BlockReduce(temp_up).Reduce(local_min_up, cuda::minimum{});
++  const math_t max_low = BlockReduce(temp_low).Reduce(local_max_low, cuda::maximum{});
++  if (threadIdx.x == 0) {
++    block_min_up[blockIdx.x]  = min_up;
++    block_max_low[blockIdx.x] = max_low;
++  }
++}
++
++template <typename math_t, int TPB = 256>
++CUML_KERNEL void compute_kkt_bounds_stage2(const math_t* __restrict__ block_min_up,
++                                           const math_t* __restrict__ block_max_low,
++                                           int num_blocks,
++                                           math_t* __restrict__ out_bounds)
++{
++  using BlockReduce = cub::BlockReduce<math_t, TPB>;
++  __shared__ typename BlockReduce::TempStorage temp_up;
++  __shared__ typename BlockReduce::TempStorage temp_low;
++
++  const math_t local_min = threadIdx.x < num_blocks ? block_min_up[threadIdx.x] : INFINITY;
++  const math_t local_max = threadIdx.x < num_blocks ? block_max_low[threadIdx.x] : -INFINITY;
++  const math_t min_up    = BlockReduce(temp_up).Reduce(local_min, cuda::minimum{});
++  const math_t max_low   = BlockReduce(temp_low).Reduce(local_max, cuda::maximum{});
++  if (threadIdx.x == 0) {
++    out_bounds[0] = min_up;
++    out_bounds[1] = max_low;
++  }
++}
++
++template <typename math_t>
++CUML_KERNEL void build_keep_mask(const math_t* __restrict__ alpha,
++                                 const math_t* __restrict__ y,
++                                 const math_t* __restrict__ C_vec,
++                                 const math_t* __restrict__ f,
++                                 int n,
++                                 math_t f_min_up,
++                                 math_t f_max_low,
++                                 math_t margin,
++                                 std::uint8_t* __restrict__ keep_mask)
++{
++  for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < n; i += gridDim.x * blockDim.x) {
++    const math_t Ci = C_vec[i];
++    bool keep       = false;
++    if (Ci > math_t{0}) {
++      const math_t ai = alpha[i];
++      const math_t yi = y[i];
++      const math_t fi = f[i];
++      keep = (in_upper(ai, yi, Ci) && fi <= f_max_low + margin) ||
++             (in_lower(ai, yi, Ci) && fi >= f_min_up - margin);
++    }
++    keep_mask[i] = keep ? std::uint8_t{1} : std::uint8_t{0};
++  }
++}
++
++template <typename math_t>
++CUML_KERNEL void gather_compact_state(const int* __restrict__ selected_local_idx,
++                                      const int* __restrict__ cur_orig_idx,
++                                      const math_t* __restrict__ src_y,
++                                      const math_t* __restrict__ src_alpha,
++                                      const math_t* __restrict__ src_f,
++                                      const math_t* __restrict__ src_C,
++                                      int new_real_rows,
++                                      int new_padded_rows,
++                                      int* __restrict__ dst_orig_idx,
++                                      math_t* __restrict__ dst_y,
++                                      math_t* __restrict__ dst_alpha,
++                                      math_t* __restrict__ dst_f,
++                                      math_t* __restrict__ dst_C)
++{
++  for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < new_padded_rows;
++       i += gridDim.x * blockDim.x) {
++    if (i < new_real_rows) {
++      const int src_i = selected_local_idx[i];
++      dst_orig_idx[i] = cur_orig_idx != nullptr ? cur_orig_idx[src_i] : src_i;
++      dst_y[i]        = src_y[src_i];
++      dst_alpha[i]    = src_alpha[src_i];
++      dst_f[i]        = src_f[src_i];
++      dst_C[i]        = src_C[src_i];
++    } else {
++      dst_f[i] = math_t{0};
++    }
++  }
++}
++
++template <typename math_t>
++CUML_KERNEL void scatter_shrunk_alpha(const int* __restrict__ orig_idx,
++                                      const math_t* __restrict__ shrunk_alpha,
++                                      int n,
++                                      math_t* __restrict__ full_alpha)
++{
++  for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < n; i += gridDim.x * blockDim.x) {
++    full_alpha[orig_idx[i]] = shrunk_alpha[i];
++  }
++}
++
++template <typename math_t>
++CUML_KERNEL void scatter_shrunk_f(const int* __restrict__ orig_idx,
++                                  const math_t* __restrict__ shrunk_f,
++                                  int n,
++                                  math_t* __restrict__ full_f)
++{
++  for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < n; i += gridDim.x * blockDim.x) {
++    full_f[orig_idx[i]] = shrunk_f[i];
++  }
++}
++
++template <typename math_t>
++CUML_KERNEL void compute_signed_delta_and_flag(const math_t* __restrict__ alpha_now,
++                                               const math_t* __restrict__ alpha_ref,
++                                               const math_t* __restrict__ y,
++                                               int n,
++                                               math_t* __restrict__ signed_delta,
++                                               std::uint8_t* __restrict__ changed_mask)
++{
++  for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < n; i += gridDim.x * blockDim.x) {
++    const math_t d  = (alpha_now[i] - alpha_ref[i]) * y[i];
++    signed_delta[i] = d;
++    changed_mask[i] = (d != math_t{0}) ? std::uint8_t{1} : std::uint8_t{0};
++  }
++}
++
++template <typename math_t>
++CUML_KERNEL void gather_changed_delta(const int* __restrict__ changed_idx,
++                                      const math_t* __restrict__ signed_delta,
++                                      int n,
++                                      math_t* __restrict__ out_delta)
++{
++  for (int i = blockIdx.x * blockDim.x + threadIdx.x; i < n; i += gridDim.x * blockDim.x) {
++    out_delta[i] = signed_delta[changed_idx[i]];
++  }
++}
++
++}  // namespace coherent_shrink
++
+ template <typename math_t>
+ void SmoSolver<math_t>::GetNonzeroDeltaAlpha(const math_t* vec,
+                                              int n_ws,
+@@ -507,6 +667,71 @@ void SmoSolver<math_t>::Solve(MatrixViewType matrix,
+   rmm::device_uvector<__half> coherent_nvfp4_kww_half(
+     use_coherent_nvfp4 ? static_cast<size_t>(n_ws) * n_ws : 0, stream);
+ 
++  const char* shrink_env = std::getenv("CUML_SVM_COHERENT_SHRINK");
++  const bool shrink_enabled =
++    use_coherent_nvfp4 && use_fp16_persistent_cache && use_bounded_column_cache &&
++    svmType == C_SVC && std::is_same_v<math_t, float> &&
++    shrink_env != nullptr && std::string(shrink_env) == "1";
++  const char* shrink_gap_env = std::getenv("CUML_SVM_SHRINK_GAP");
++  const float shrink_gap1 =
++    shrink_gap_env != nullptr ? std::atof(shrink_gap_env) : 0.25f;
++  const char* shrink_gap2_env = std::getenv("CUML_SVM_SHRINK_GAP2");
++  const float shrink_gap2 =
++    shrink_gap2_env != nullptr ? std::atof(shrink_gap2_env) : -1.0f;
++  const char* shrink_margin_env = std::getenv("CUML_SVM_SHRINK_MARGIN");
++  const float shrink_margin =
++    shrink_margin_env != nullptr ? std::max(0.0f, static_cast<float>(std::atof(shrink_margin_env))) : 0.25f;
++  const char* shrink_min_outer_env = std::getenv("CUML_SVM_SHRINK_MIN_OUTER");
++  const int shrink_min_outer =
++    shrink_min_outer_env != nullptr ? std::max(1, std::atoi(shrink_min_outer_env)) : 50;
++
++  int active_real_rows    = n_rows;
++  int active_padded_rows  = n_rows;
++  void* active_nvfp4_ctx  = nullptr;
++  math_t* active_y        = y;
++  math_t* active_alpha    = alpha.data();
++  math_t* active_f        = f.data();
++  const math_t* active_C  = C_vec.data();
++  WorkingSet<math_t>* active_ws_ptr = &ws;
++  int active_cache_capacity = column_cache_capacity;
++  bool is_shrunk            = false;
++  bool shrink_finished      = false;
++  int shrink_stage          = 0;
++  int shrink_iter1          = -1;
++  int shrink_iter2          = -1;
++  int unshrink_iter         = -1;
++  int shrink_rows1          = n_rows;
++  int shrink_rows2          = n_rows;
++  long long shrink_reconstruct_cols = 0;
++  int polish_iters          = 0;
++
++  Nvfp4ContextPtr shrunk_nvfp4_ctx(nullptr, coherent_nvfp4_destroy_context);
++  std::unique_ptr<WorkingSet<math_t>> shrunk_ws;
++  rmm::device_uvector<int> shrunk_orig_idx(0, stream);
++  rmm::device_uvector<math_t> shrunk_y(0, stream);
++  rmm::device_uvector<math_t> shrunk_alpha(0, stream);
++  rmm::device_uvector<math_t> shrunk_f(0, stream);
++  rmm::device_uvector<math_t> shrunk_C(0, stream);
++  rmm::device_uvector<math_t> f_at_shrink(0, stream);
++  rmm::device_uvector<math_t> alpha_at_shrink(0, stream);
++  rmm::device_uvector<math_t> d_kkt_block_min(shrink_enabled ? 256 : 0, stream);
++  rmm::device_uvector<math_t> d_kkt_block_max(shrink_enabled ? 256 : 0, stream);
++  rmm::device_uvector<math_t> d_kkt_bounds(shrink_enabled ? 2 : 0, stream);
++  rmm::device_uvector<std::uint8_t> d_keep_mask(shrink_enabled ? n_rows : 0, stream);
++  rmm::device_uvector<int> d_selected_idx(shrink_enabled ? n_rows : 0, stream);
++  rmm::device_uvector<int> d_nnz_scalar(shrink_enabled ? 1 : 0, stream);
++  rmm::device_uvector<math_t> d_full_delta(shrink_enabled ? n_rows : 0, stream);
++  rmm::device_uvector<int> d_changed_idx(shrink_enabled ? n_rows : 0, stream);
++  rmm::device_uvector<math_t> d_changed_delta(shrink_enabled ? n_rows : 0, stream);
++  rmm::device_uvector<std::uint8_t> d_cub_temp(0, stream);
++  size_t cub_temp_bytes = 0;
++  rmm::device_uvector<int> shrunk_identity_slots(shrink_enabled ? n_ws : 0, stream);
++  if (shrink_enabled) {
++    thrust::sequence(thrust::cuda::par.on(stream),
++                     shrunk_identity_slots.data(),
++                     shrunk_identity_slots.data() + n_ws);
++  }
++
+   // Coherent-tile experiment: evaluate K[W,W] with the same FP16-input TMA
+   // mainloop and FP32 RBF epilogue used by the no-cache full-gradient update.
+   // Keep the RBF result in FP32: rounding only K[W,W] to half would make the
+@@ -729,6 +954,7 @@ void SmoSolver<math_t>::Solve(MatrixViewType matrix,
+           "Unable to create sm_120a coherent NVFP4 RBF context");
+       }
+       RAFT_CUDA_TRY(cudaPeekAtLastError());
++      active_nvfp4_ctx = coherent_nvfp4_context.get();
+     }
+     if (use_fp16_tma_repair) {
+       thrust::sequence(thrust::cuda::par.on(stream),
+@@ -812,14 +1038,14 @@ void SmoSolver<math_t>::Solve(MatrixViewType matrix,
+     {
+       raft::common::nvtx::range<> stage{"SmoSolver::ws_select"};
+       RAFT_CUDA_TRY(cudaMemsetAsync(delta_alpha.data(), 0, n_ws * sizeof(math_t), stream));
+-      ws.Select(f.data(), alpha.data(), y, C_vec.data());
++      active_ws_ptr->Select(active_f, active_alpha, active_y, active_C);
+       RAFT_CUDA_TRY(cudaPeekAtLastError());
+       if (trace_enabled) {
+-        raft::update_host(trace_selected.data(), ws.GetIndices(), n_ws, stream);
++        raft::update_host(trace_selected.data(), active_ws_ptr->GetIndices(), n_ws, stream);
+       }
+     }
+ 
+-    cache.InitWorkingSet(ws.GetIndices());
++    cache.InitWorkingSet(active_ws_ptr->GetIndices());
+ 
+     if (use_overlap_prefetch) {
+       RAFT_CUDA_TRY(cudaMemcpyAsync(column_cache_prefetch_ws_host,
+@@ -935,14 +1161,14 @@ void SmoSolver<math_t>::Solve(MatrixViewType matrix,
+         raft::common::nvtx::range<> stage{
+           "SmoSolver::coherent_nvfp4_working_set_kernel"};
+         int nvfp4_status = coherent_nvfp4_gather(
+-          coherent_nvfp4_context.get(),
++          active_nvfp4_ctx,
+           cache.getKernelIndices(false),
+           n_ws,
+           n_ws,
+           reinterpret_cast<void*>(stream));
+         RAFT_CUDA_TRY(static_cast<cudaError_t>(nvfp4_status));
+         nvfp4_status = coherent_nvfp4_materialize_kww_fp16(
+-          coherent_nvfp4_context.get(),
++          active_nvfp4_ctx,
+           coherent_nvfp4_kww_half.data(),
+           n_ws,
+           n_ws,
+@@ -1014,59 +1240,59 @@ void SmoSolver<math_t>::Solve(MatrixViewType matrix,
+         (max_iter == -1 ? max_inner_iter : std::min(max_inner_iter, max_iter - n_iter));
+       if (n_ws == SMO_WS_SIZE && block_threads == 512) {
+         SmoBlockSolveCoarsened<math_t, 512, 2><<<1, 512, 0, stream>>>(
+-          y,
+-          n_train,
+-          alpha.data(),
++          active_y,
++          active_real_rows,
++          active_alpha,
+           n_ws,
+           delta_alpha.data(),
+-          f.data(),
++          active_f,
+           cacheTile,
+           cache.getKernelIndices(true),
+-          C_vec.data(),
++          active_C,
+           tol,
+           return_buff.data(),
+           max_iter_this_block,
+           svmType);
+       } else if (n_ws == SMO_WS_SIZE && block_threads == 256) {
+         SmoBlockSolveCoarsened<math_t, 256, 4><<<1, 256, 0, stream>>>(
+-          y,
+-          n_train,
+-          alpha.data(),
++          active_y,
++          active_real_rows,
++          active_alpha,
+           n_ws,
+           delta_alpha.data(),
+-          f.data(),
++          active_f,
+           cacheTile,
+           cache.getKernelIndices(true),
+-          C_vec.data(),
++          active_C,
+           tol,
+           return_buff.data(),
+           max_iter_this_block,
+           svmType);
+       } else if (n_ws == SMO_WS_SIZE && block_threads == 128) {
+         SmoBlockSolveCoarsened<math_t, 128, 8><<<1, 128, 0, stream>>>(
+-          y,
+-          n_train,
+-          alpha.data(),
++          active_y,
++          active_real_rows,
++          active_alpha,
+           n_ws,
+           delta_alpha.data(),
+-          f.data(),
++          active_f,
+           cacheTile,
+           cache.getKernelIndices(true),
+-          C_vec.data(),
++          active_C,
+           tol,
+           return_buff.data(),
+           max_iter_this_block,
+           svmType);
+       } else if (n_ws <= SMO_WS_SIZE) {
+-        SmoBlockSolve<math_t, SMO_WS_SIZE><<<1, n_ws, 0, stream>>>(y,
+-                                                                   n_train,
+-                                                                   alpha.data(),
++        SmoBlockSolve<math_t, SMO_WS_SIZE><<<1, n_ws, 0, stream>>>(active_y,
++                                                                   active_real_rows,
++                                                                   active_alpha,
+                                                                    n_ws,
+                                                                    delta_alpha.data(),
+-                                                                   f.data(),
++                                                                   active_f,
+                                                                    cacheTile,
+                                                                    cache.getKernelIndices(true),
+-                                                                   C_vec.data(),
++                                                                   active_C,
+                                                                    tol,
+                                                                    return_buff.data(),
+                                                                    max_iter_this_block,
+@@ -1318,7 +1544,7 @@ void SmoSolver<math_t>::Solve(MatrixViewType matrix,
+                 // Do not evict a cached column that this update still needs.
+                 for (int column = 0; column < nnz_da; ++column) {
+                   const int index = column_cache_active_indices[column];
+-                  if (index < 0 || index >= n_rows) {
++                  if (index < 0 || index >= active_real_rows) {
+                     throw std::runtime_error("SMO column-cache index is out of range");
+                   }
+                   const int slot = column_cache_slot_of[index];
+@@ -1327,13 +1553,13 @@ void SmoSolver<math_t>::Solve(MatrixViewType matrix,
+               }
+               for (int column = 0; column < nnz_da; ++column) {
+                 const int index = column_cache_active_indices[column];
+-                if (index < 0 || index >= n_rows) {
++                if (index < 0 || index >= active_real_rows) {
+                   throw std::runtime_error("SMO column-cache index is out of range");
+                 }
+                 int slot = column_cache_slot_of[index];
+                 if (slot < 0) {
+                   if (use_bounded_column_cache) {
+-                    if (column_cache_next_slot < column_cache_capacity) {
++                    if (column_cache_next_slot < active_cache_capacity) {
+                       slot = column_cache_next_slot++;
+                     } else {
+                       auto victim = column_cache_lru.begin();
+@@ -1412,14 +1638,14 @@ void SmoSolver<math_t>::Solve(MatrixViewType matrix,
+                 if (use_coherent_nvfp4) {
+                   const int padded_cols = raft::ceildiv(new_count, 128) * 128;
+                   int nvfp4_status = coherent_nvfp4_gather(
+-                    coherent_nvfp4_context.get(),
++                    active_nvfp4_ctx,
+                     column_cache_new_indices.data(),
+                     new_count,
+                     padded_cols,
+                     reinterpret_cast<void*>(stream));
+                   RAFT_CUDA_TRY(static_cast<cudaError_t>(nvfp4_status));
+                   nvfp4_status = coherent_nvfp4_materialize_slotted_fp16(
+-                    coherent_nvfp4_context.get(),
++                    active_nvfp4_ctx,
+                     column_cache_new_slots.data(),
+                     column_cache_fp16.data(),
+                     new_count,
+@@ -1719,8 +1945,8 @@ void SmoSolver<math_t>::Solve(MatrixViewType matrix,
+                       column_cache_fp16.data(),
+                       column_cache_hit_slots.data(),
+                       column_cache_hit_delta.data(),
+-                      f.data(),
+-                      n_rows,
++                      active_f,
++                      active_padded_rows,
+                       apply_count,
+                       stream);
+                   } else {
+@@ -1860,6 +2086,8 @@ void SmoSolver<math_t>::Solve(MatrixViewType matrix,
+         }
+         if (fp16_tma_repair_mode) { repair_updates++; }
+       }
++    } else if (nnz_da == 0 && !update_completed) {
++      cache.FinishWorkingSetWithoutBatching();
+     }
+     {
+       raft::common::nvtx::range<> stage{"SmoSolver::iteration_sync"};
+@@ -1932,6 +2160,295 @@ void SmoSolver<math_t>::Solve(MatrixViewType matrix,
+       if (n_outer_iter % 500 == 0) {
+         CUML_LOG_DEBUG("SMO iteration %d, diff %lf", n_outer_iter, (double)diff);
+       }
++      if constexpr (std::is_same_v<math_t, float>) {
++        if (shrink_enabled) {
++          if (!is_shrunk && shrink_finished) { ++polish_iters; }
++          const bool hit_iter_limit =
++            (max_iter != -1 && n_iter >= max_iter) || n_outer_iter >= max_outer_iter;
++          auto compute_bounds = [&](const math_t* a_ptr,
++                                    const math_t* y_ptr,
++                                    const math_t* C_ptr,
++                                    const math_t* f_ptr,
++                                    int n_len,
++                                    math_t& out_min_up,
++                                    math_t& out_max_low) {
++            constexpr int kBlocks = 256;
++            coherent_shrink::compute_kkt_bounds_stage1<math_t, 256>
++              <<<kBlocks, 256, 0, stream>>>(a_ptr,
++                                           y_ptr,
++                                           C_ptr,
++                                           f_ptr,
++                                           n_len,
++                                           d_kkt_block_min.data(),
++                                           d_kkt_block_max.data());
++            coherent_shrink::compute_kkt_bounds_stage2<math_t, 256>
++              <<<1, 256, 0, stream>>>(
++                d_kkt_block_min.data(), d_kkt_block_max.data(), kBlocks, d_kkt_bounds.data());
++            math_t h_bounds[2] = {INFINITY, -INFINITY};
++            raft::update_host(h_bounds, d_kkt_bounds.data(), 2, stream);
++            handle.sync_stream(stream);
++            out_min_up  = h_bounds[0];
++            out_max_low = h_bounds[1];
++          };
++          auto ensure_cub_temp = [&](size_t needed) {
++            if (needed > cub_temp_bytes) {
++              cub_temp_bytes = needed;
++              d_cub_temp.resize(cub_temp_bytes, stream);
++            }
++          };
++
++          if (is_shrunk && !keep_going) {
++            raft::common::nvtx::range<> shrink_stage_nvtx{"SmoSolver::unshrink_reconstruct"};
++            constexpr int kThreads = 256;
++            coherent_shrink::scatter_shrunk_alpha<math_t>
++              <<<raft::ceildiv(active_real_rows, kThreads), kThreads, 0, stream>>>(
++                shrunk_orig_idx.data(), active_alpha, active_real_rows, alpha.data());
++            RAFT_CUDA_TRY(cudaMemcpyAsync(f.data(),
++                                          f_at_shrink.data(),
++                                          static_cast<size_t>(n_rows) * sizeof(math_t),
++                                          cudaMemcpyDeviceToDevice,
++                                          stream));
++            coherent_shrink::compute_signed_delta_and_flag<math_t>
++              <<<raft::ceildiv(n_rows, kThreads), kThreads, 0, stream>>>(
++                alpha.data(),
++                alpha_at_shrink.data(),
++                y,
++                n_rows,
++                d_full_delta.data(),
++                d_keep_mask.data());
++            size_t needed = 0;
++            thrust::counting_iterator<int> count_iter(0);
++            RAFT_CUDA_TRY(cub::DeviceSelect::Flagged(nullptr,
++                                                     needed,
++                                                     count_iter,
++                                                     d_keep_mask.data(),
++                                                     d_changed_idx.data(),
++                                                     d_nnz_scalar.data(),
++                                                     n_rows,
++                                                     stream));
++            ensure_cub_temp(needed);
++            RAFT_CUDA_TRY(cub::DeviceSelect::Flagged(d_cub_temp.data(),
++                                                     cub_temp_bytes,
++                                                     count_iter,
++                                                     d_keep_mask.data(),
++                                                     d_changed_idx.data(),
++                                                     d_nnz_scalar.data(),
++                                                     n_rows,
++                                                     stream));
++            int nnz_changed = 0;
++            raft::update_host(&nnz_changed, d_nnz_scalar.data(), 1, stream);
++            handle.sync_stream(stream);
++            shrink_reconstruct_cols += nnz_changed;
++            if (nnz_changed > 0) {
++              coherent_shrink::gather_changed_delta<math_t>
++                <<<raft::ceildiv(nnz_changed, kThreads), kThreads, 0, stream>>>(
++                  d_changed_idx.data(), d_full_delta.data(), nnz_changed, d_changed_delta.data());
++              const int chunk_max = std::min(n_ws, 1024);
++              for (int offset = 0; offset < nnz_changed; offset += chunk_max) {
++                const int chunk  = std::min(chunk_max, nnz_changed - offset);
++                const int padded = raft::ceildiv(chunk, 128) * 128;
++                int nvfp4_status = coherent_nvfp4_gather(coherent_nvfp4_context.get(),
++                                                         d_changed_idx.data() + offset,
++                                                         chunk,
++                                                         padded,
++                                                         reinterpret_cast<void*>(stream));
++                RAFT_CUDA_TRY(static_cast<cudaError_t>(nvfp4_status));
++                nvfp4_status = coherent_nvfp4_materialize_slotted_fp16(
++                  coherent_nvfp4_context.get(),
++                  shrunk_identity_slots.data(),
++                  column_cache_fp16.data(),
++                  chunk,
++                  padded,
++                  static_cast<float>(rbf_gamma),
++                  reinterpret_cast<void*>(stream));
++                RAFT_CUDA_TRY(static_cast<cudaError_t>(nvfp4_status));
++                fused_rbf::column_cache::apply_tiled_order_fp16(
++                  column_cache_fp16.data(),
++                  shrunk_identity_slots.data(),
++                  d_changed_delta.data() + offset,
++                  f.data(),
++                  n_rows,
++                  chunk,
++                  stream);
++              }
++            }
++            coherent_shrink::scatter_shrunk_f<math_t>
++              <<<raft::ceildiv(active_real_rows, kThreads), kThreads, 0, stream>>>(
++                shrunk_orig_idx.data(), active_f, active_real_rows, f.data());
++            handle.sync_stream(stream);
++            shrunk_nvfp4_ctx.reset();
++            shrunk_ws.reset();
++            active_real_rows      = n_rows;
++            active_padded_rows    = n_rows;
++            active_nvfp4_ctx      = coherent_nvfp4_context.get();
++            active_y              = y;
++            active_alpha          = alpha.data();
++            active_f              = f.data();
++            active_C              = C_vec.data();
++            active_ws_ptr         = &ws;
++            active_cache_capacity = column_cache_capacity;
++            column_cache_slot_of.assign(n_rows, -1);
++            column_cache_index_of_slot.assign(column_cache_capacity, -1);
++            column_cache_last_used.assign(column_cache_capacity, 0);
++            column_cache_pinned.assign(column_cache_capacity, 0);
++            column_cache_lru.clear();
++            column_cache_next_slot = 0;
++            is_shrunk              = false;
++            shrink_finished        = true;
++            unshrink_iter          = n_outer_iter;
++
++            math_t g_min_up = INFINITY, g_max_low = -INFINITY;
++            compute_bounds(alpha.data(), y, C_vec.data(), f.data(), n_rows, g_min_up, g_max_low);
++            const math_t global_diff = g_max_low - g_min_up;
++            diff_prev                = global_diff;
++            if (!hit_iter_limit && !isnan(global_diff) && global_diff >= tol) {
++              keep_going   = true;
++              n_small_diff = 0;
++            }
++          } else if (keep_going && !hit_iter_limit && !shrink_finished &&
++                     n_outer_iter >= shrink_min_outer &&
++                     ((shrink_stage == 0 && std::abs(diff) <= shrink_gap1) ||
++                      (shrink_stage == 1 && shrink_gap2 > 0.0f &&
++                       std::abs(diff) <= shrink_gap2))) {
++            raft::common::nvtx::range<> shrink_stage_nvtx{"SmoSolver::active_set_shrink"};
++            math_t c_min_up = INFINITY, c_max_low = -INFINITY;
++            compute_bounds(
++              active_alpha, active_y, active_C, active_f, active_real_rows, c_min_up, c_max_low);
++            const math_t cur_gap = c_max_low - c_min_up;
++            if (cur_gap > tol && cur_gap > math_t{0}) {
++              constexpr int kThreads = 256;
++              const math_t margin    = static_cast<math_t>(shrink_margin) * cur_gap;
++              coherent_shrink::build_keep_mask<math_t>
++                <<<raft::ceildiv(active_real_rows, kThreads), kThreads, 0, stream>>>(
++                  active_alpha,
++                  active_y,
++                  active_C,
++                  active_f,
++                  active_real_rows,
++                  c_min_up,
++                  c_max_low,
++                  margin,
++                  d_keep_mask.data());
++              size_t needed = 0;
++              thrust::counting_iterator<int> count_iter(0);
++              RAFT_CUDA_TRY(cub::DeviceSelect::Flagged(nullptr,
++                                                       needed,
++                                                       count_iter,
++                                                       d_keep_mask.data(),
++                                                       d_selected_idx.data(),
++                                                       d_nnz_scalar.data(),
++                                                       active_real_rows,
++                                                       stream));
++              ensure_cub_temp(needed);
++              RAFT_CUDA_TRY(cub::DeviceSelect::Flagged(d_cub_temp.data(),
++                                                       cub_temp_bytes,
++                                                       count_iter,
++                                                       d_keep_mask.data(),
++                                                       d_selected_idx.data(),
++                                                       d_nnz_scalar.data(),
++                                                       active_real_rows,
++                                                       stream));
++              int new_active = 0;
++              raft::update_host(&new_active, d_nnz_scalar.data(), 1, stream);
++              handle.sync_stream(stream);
++
++              if (new_active > n_ws &&
++                  new_active < static_cast<int>(0.85 * active_real_rows)) {
++                const int new_padded = raft::ceildiv(new_active, 128) * 128;
++                if (is_shrunk) {
++                  coherent_shrink::scatter_shrunk_alpha<math_t>
++                    <<<raft::ceildiv(active_real_rows, kThreads), kThreads, 0, stream>>>(
++                      shrunk_orig_idx.data(), active_alpha, active_real_rows, alpha.data());
++                }
++                if (shrink_stage == 0) {
++                  f_at_shrink.resize(n_rows, stream);
++                  alpha_at_shrink.resize(n_rows, stream);
++                  RAFT_CUDA_TRY(cudaMemcpyAsync(f_at_shrink.data(),
++                                                f.data(),
++                                                static_cast<size_t>(n_rows) * sizeof(math_t),
++                                                cudaMemcpyDeviceToDevice,
++                                                stream));
++                  RAFT_CUDA_TRY(cudaMemcpyAsync(alpha_at_shrink.data(),
++                                                alpha.data(),
++                                                static_cast<size_t>(n_rows) * sizeof(math_t),
++                                                cudaMemcpyDeviceToDevice,
++                                                stream));
++                }
++                rmm::device_uvector<int> new_orig_idx(new_active, stream);
++                rmm::device_uvector<math_t> new_y(new_active, stream);
++                rmm::device_uvector<math_t> new_alpha(new_active, stream);
++                rmm::device_uvector<math_t> new_f(new_padded, stream);
++                rmm::device_uvector<math_t> new_C(new_active, stream);
++                coherent_shrink::gather_compact_state<math_t>
++                  <<<raft::ceildiv(new_padded, kThreads), kThreads, 0, stream>>>(
++                    d_selected_idx.data(),
++                    is_shrunk ? shrunk_orig_idx.data() : nullptr,
++                    active_y,
++                    active_alpha,
++                    active_f,
++                    active_C,
++                    new_active,
++                    new_padded,
++                    new_orig_idx.data(),
++                    new_y.data(),
++                    new_alpha.data(),
++                    new_f.data(),
++                    new_C.data());
++                Nvfp4ContextPtr next_ctx(
++                  coherent_nvfp4_create_subcontext(active_nvfp4_ctx,
++                                                   d_selected_idx.data(),
++                                                   new_active,
++                                                   new_padded,
++                                                   reinterpret_cast<void*>(stream)),
++                  coherent_nvfp4_destroy_context);
++                if (!next_ctx) {
++                  throw std::runtime_error(
++                    "Unable to create shrunk sm_120a coherent NVFP4 subcontext");
++                }
++                auto next_ws = std::make_unique<WorkingSet<math_t>>(
++                  handle, stream, new_active, n_ws, svmType);
++                handle.sync_stream(stream);
++
++                shrunk_orig_idx  = std::move(new_orig_idx);
++                shrunk_y         = std::move(new_y);
++                shrunk_alpha     = std::move(new_alpha);
++                shrunk_f         = std::move(new_f);
++                shrunk_C         = std::move(new_C);
++                shrunk_nvfp4_ctx = std::move(next_ctx);
++                shrunk_ws        = std::move(next_ws);
++
++                active_real_rows   = new_active;
++                active_padded_rows = new_padded;
++                active_nvfp4_ctx   = shrunk_nvfp4_ctx.get();
++                active_y           = shrunk_y.data();
++                active_alpha       = shrunk_alpha.data();
++                active_f           = shrunk_f.data();
++                active_C           = shrunk_C.data();
++                active_ws_ptr      = shrunk_ws.get();
++                active_cache_capacity = static_cast<int>(std::min<size_t>(
++                  static_cast<size_t>(new_active),
++                  (static_cast<size_t>(column_cache_capacity) * n_rows) /
++                    static_cast<size_t>(new_padded)));
++                column_cache_slot_of.assign(active_real_rows, -1);
++                column_cache_index_of_slot.assign(active_cache_capacity, -1);
++                column_cache_last_used.assign(active_cache_capacity, 0);
++                column_cache_pinned.assign(active_cache_capacity, 0);
++                column_cache_lru.clear();
++                column_cache_next_slot = 0;
++                is_shrunk              = true;
++                ++shrink_stage;
++                if (shrink_stage == 1) {
++                  shrink_iter1 = n_outer_iter;
++                  shrink_rows1 = new_active;
++                } else {
++                  shrink_iter2 = n_outer_iter;
++                  shrink_rows2 = new_active;
++                }
++              }
++            }
++          }
++        }
++      }
+     }
+   }
+ 
+@@ -1970,7 +2487,7 @@ void SmoSolver<math_t>::Solve(MatrixViewType matrix,
+     coherent_mxfp8_full_context.reset();
+     coherent_mxfp8_kww_context.reset();
+   }
+-  if (use_coherent_nvfp4) { coherent_nvfp4_context.reset(); }
++  if (use_coherent_nvfp4) { shrunk_nvfp4_ctx.reset(); coherent_nvfp4_context.reset(); }
+ 
+   const char* fused_stats_env = std::getenv("CUML_SVM_FUSED_RBF_STATS");
+   if (fused_stats_env != nullptr && std::string(fused_stats_env) == "1") {
+@@ -2091,7 +2608,16 @@ void SmoSolver<math_t>::Solve(MatrixViewType matrix,
+               << " bounded_cache=" << use_bounded_column_cache
+               << " overlap_prefetch=" << use_overlap_prefetch
+               << " persist_block_tile=" << use_persist_block_tile
+-              << " persist_block_tile_bytes=" << persist_block_tile_bytes << std::endl;
++              << " persist_block_tile_bytes=" << persist_block_tile_bytes
++              << " shrink_enabled=" << shrink_enabled
++              << " shrink_stages=" << shrink_stage
++              << " shrink_rows1=" << shrink_rows1
++              << " shrink_rows2=" << shrink_rows2
++              << " shrink_iter1=" << shrink_iter1
++              << " shrink_iter2=" << shrink_iter2
++              << " unshrink_iter=" << unshrink_iter
++              << " reconstruct_cols=" << shrink_reconstruct_cols
++              << " polish_iters=" << polish_iters << std::endl;
+   }
+ 
+   CUML_LOG_DEBUG(
+diff --git a/research/svm/coherent_nvfp4_fp16_cache/coherent_nvfp4_runtime.cu b/research/svm/coherent_nvfp4_fp16_cache/coherent_nvfp4_runtime.cu
+index 77c3362..b0655e7 100644
+--- a/research/svm/coherent_nvfp4_fp16_cache/coherent_nvfp4_runtime.cu
++++ b/research/svm/coherent_nvfp4_fp16_cache/coherent_nvfp4_runtime.cu
+@@ -24,7 +24,7 @@ constexpr std::uint32_t kUnitScaleWord = 0x38383838u;
+ __device__ __forceinline__ float encode_decode_e4m3_scale(float maximum)
+ {
+   if (!(maximum > 0.0f)) { return 1.0f; }
+-  const float requested = fmaxf(maximum * 0.25f, 1.0e-6f);
++  const float requested = fmaxf(maximum * (1.0f / 6.0f), 1.0e-6f);
+   const __nv_fp8_e4m3 encoded(requested);
+   const float decoded = static_cast<float>(encoded);
+   return decoded > 0.0f ? decoded : 1.0e-6f;
+@@ -598,6 +598,361 @@ __global__ void reference_pairs(const std::uint8_t* __restrict__ packed_x,
+   }
+ }
+ 
++
++__global__
++__launch_bounds__(384, 1)
++void sm120_nvfp4_rbf_fused_kernel(
++    const __grid_constant__ CUtensorMap tmaA,
++    const __grid_constant__ CUtensorMap tmaB,
++    const uint32_t* __restrict__ scale_A_tiled,
++    const uint32_t* __restrict__ scale_B_tiled,
++    const int* __restrict__ tile_ids,
++    const float* __restrict__ norm_x,
++    const float* __restrict__ norm_w,
++    const int* __restrict__ selected_indices,
++    const int* __restrict__ slots,
++    __half* __restrict__ cache,
++    int cache_rows,
++    int active_cols,
++    int K,
++    int total_tiles,
++    float gamma)
++{
++    __shared__ __align__(128) uint8_t smA[PIPE_STAGES][BM * ROW_BYTES];
++    __shared__ __align__(128) uint8_t smB[PIPE_STAGES][BN * ROW_BYTES];
++    __shared__ __align__(16)  uint32_t smSA[PIPE_STAGES][SA_WORDS];
++    __shared__ __align__(16)  uint32_t smSB[PIPE_STAGES][SB_WORDS];
++    __shared__ __align__(8)   uint64_t mbar_full[PIPE_STAGES];
++    __shared__ __align__(8)   uint64_t mbar_empty[PIPE_STAGES];
++    __shared__ __align__(16)  __half sK[NUM_CONSUMER_WG][BN][BM_WG + 2];
++    __shared__ float smNormA[NUM_CONSUMER_WG][BM_WG];
++    __shared__ float smNormB[NUM_CONSUMER_WG][BN];
++    __shared__ int smSelB[NUM_CONSUMER_WG][BN];
++    __shared__ int smSlots[NUM_CONSUMER_WG][BN];
++
++    const int tid = threadIdx.x;
++    const int wg_idx = tid / 128;
++    const int warp_id = tid / 32;
++    const int lane = tid & 31;
++    const int k_tiles = K / BK;
++
++    constexpr uint32_t TMA_A_BYTES = BM * ROW_BYTES;
++    constexpr uint32_t TMA_B_BYTES = BN * ROW_BYTES;
++    constexpr uint32_t TOTAL_TMA = TMA_A_BYTES + TMA_B_BYTES + SA_BYTES + SB_BYTES;
++
++    if (tid < PIPE_STAGES) {
++        init_bar(&mbar_full[tid], 1);
++        init_bar(&mbar_empty[tid], CONSUMER_WARPS);
++    }
++    asm volatile("bar.sync 0;");
++
++    const uint64_t tmapA = reinterpret_cast<uint64_t>(&tmaA);
++    const uint64_t tmapB = reinterpret_cast<uint64_t>(&tmaB);
++
++    uint64_t sA[PIPE_STAGES], sB[PIPE_STAGES], mF[PIPE_STAGES];
++    uint64_t sSA[PIPE_STAGES], sSB[PIPE_STAGES];
++    #pragma unroll
++    for (int s = 0; s < PIPE_STAGES; ++s) {
++        sA[s]  = static_cast<uint64_t>(__cvta_generic_to_shared(&smA[s][0]));
++        sB[s]  = static_cast<uint64_t>(__cvta_generic_to_shared(&smB[s][0]));
++        sSA[s] = static_cast<uint64_t>(__cvta_generic_to_shared(&smSA[s][0]));
++        sSB[s] = static_cast<uint64_t>(__cvta_generic_to_shared(&smSB[s][0]));
++        mF[s]  = static_cast<uint64_t>(__cvta_generic_to_shared(&mbar_full[s]));
++    }
++
++    const size_t sa_stride = static_cast<size_t>(k_tiles) * SA_WORDS;
++    const size_t sb_stride = static_cast<size_t>(k_tiles) * SB_WORDS;
++
++    if (wg_idx == 0) {
++        if (warp_id == 0 && lane == 0) {
++            int qidx = 0, p_empty = 0;
++            for (int i = blockIdx.x; i < total_tiles; i += gridDim.x) {
++                const int packed = __ldg(tile_ids + i);
++                const int mt_idx = (packed >> 16) & 0xFFFF;
++                const int nt_idx = packed & 0xFFFF;
++                const int block_m = mt_idx * BM;
++                const int block_n = nt_idx * BN;
++                const uint64_t gSA = reinterpret_cast<uint64_t>(scale_A_tiled + size_t(mt_idx) * sa_stride);
++                const uint64_t gSB = reinterpret_cast<uint64_t>(scale_B_tiled + size_t(nt_idx) * sb_stride);
++
++                for (int kt = 0; kt < k_tiles; ++kt) {
++                    if (qidx == PIPE_STAGES) { qidx = 0; p_empty ^= 1; }
++                    wait_bar(&mbar_empty[qidx], p_empty);
++                    if (lane == 0) arrive_tx(&mbar_full[qidx], TOTAL_TMA);
++                    const int k_off = kt * BK_PACKED;
++                    const uint64_t gSA_k = gSA + size_t(kt) * SA_BYTES;
++                    const uint64_t gSB_k = gSB + size_t(kt) * SB_BYTES;
++                    asm volatile("cp.async.bulk.tensor.2d.shared::cta.global.tile.mbarrier::complete_tx::bytes [%0],[%1,{%2,%3}],[%4];\n"
++                        ::"l"(sA[qidx]),"l"(tmapA),"r"(k_off),"r"(block_m),"l"(mF[qidx]):"memory");
++                    asm volatile("cp.async.bulk.tensor.2d.shared::cta.global.tile.mbarrier::complete_tx::bytes [%0],[%1,{%2,%3}],[%4];\n"
++                        ::"l"(sB[qidx]),"l"(tmapB),"r"(k_off),"r"(block_n),"l"(mF[qidx]):"memory");
++                    asm volatile("cp.async.bulk.shared::cta.global.mbarrier::complete_tx::bytes [%0],[%1],%2,[%3];\n"
++                        ::"l"(sSA[qidx]),"l"(gSA_k),"r"(SA_BYTES),"l"(mF[qidx]):"memory");
++                    asm volatile("cp.async.bulk.shared::cta.global.mbarrier::complete_tx::bytes [%0],[%1],%2,[%3];\n"
++                        ::"l"(sSB[qidx]),"l"(gSB_k),"r"(SB_BYTES),"l"(mF[qidx]):"memory");
++                    ++qidx;
++                }
++            }
++        }
++    } else {
++        const int consumer_wg_id = wg_idx - 1;
++        const int tid_in_wg = tid - (wg_idx * 128);
++        const int warp_id_in_wg = warp_id - PRODUCER_WARPS - consumer_wg_id * CONSUMER_WARPS_PER_WG;
++        const int cwn = warp_id_in_wg;
++
++        const int gid = lane >> 2;
++        const int tig = lane & 3;
++        const int lane_n8 = lane & 7;
++        const int sa_rl = (tig == 1) ? (gid + 8) : gid;
++
++        if (lane == 0) {
++            #pragma unroll
++            for (int q = 0; q < PIPE_STAGES; ++q) arrive(&mbar_empty[q]);
++        }
++
++        float c_frag[WM_TILES][WN_TILES][8];
++        #pragma unroll 4
++        for (int wm=0;wm<WM_TILES;++wm)
++            #pragma unroll 2
++            for (int wn=0;wn<WN_TILES;++wn)
++                #pragma unroll 8
++                for (int i=0;i<8;++i) c_frag[wm][wn][i]=0.f;
++
++        int qidx = 0, p_full = 0;
++        const int bar_pre  = consumer_wg_id + 3;
++        const int bar_post = consumer_wg_id + 5;
++
++        for (int i = blockIdx.x; i < total_tiles; i += gridDim.x) {
++            const int packed = __ldg(tile_ids + i);
++            const int mt_idx = (packed >> 16) & 0xFFFF;
++            const int nt_idx = packed & 0xFFFF;
++            const int block_m = mt_idx * BM;
++            const int block_n = nt_idx * BN;
++
++            for (int kt = 0; kt < k_tiles; ++kt) {
++                if (qidx == PIPE_STAGES) { qidx = 0; p_full ^= 1; }
++                wait_bar(&mbar_full[qidx], p_full);
++
++                const uint32_t smA_b = cvta_shared_u32(&smA[qidx][0]);
++                const uint32_t smB_b = cvta_shared_u32(&smB[qidx][0]);
++                const uint32_t* cSA = smSA[qidx];
++                const uint32_t* cSB = smSB[qidx];
++
++                uint32_t sa_c[WM_TILES][K_FRAGS];
++                #pragma unroll 4
++                for (int wm=0;wm<WM_TILES;++wm) {
++                    const int sr = consumer_wg_id*BM_WG + wm*MMA_M + sa_rl;
++                    #pragma unroll 2
++                    for (int kf=0;kf<K_FRAGS;++kf)
++                        sa_c[wm][kf] = cSA[sr*K_FRAGS+kf];
++                }
++                uint32_t sb0_c[WN_TILES][K_FRAGS], sb1_c[WN_TILES][K_FRAGS];
++                #pragma unroll 2
++                for (int wn=0;wn<WN_TILES;++wn) {
++                    const int sc0 = cwn*WN_TILES*MMA_N + wn*MMA_N + gid;
++                    const int sc1 = sc0 + 8;
++                    #pragma unroll 2
++                    for (int kf=0;kf<K_FRAGS;++kf) {
++                        sb0_c[wn][kf] = cSB[sc0*K_FRAGS+kf];
++                        sb1_c[wn][kf] = cSB[sc1*K_FRAGS+kf];
++                    }
++                }
++
++                #pragma unroll 2
++                for (int kf = 0; kf < K_FRAGS; ++kf) {
++                    uint32_t br[WN_TILES][4];
++                    #pragma unroll 2
++                    for (int wn=0;wn<WN_TILES;++wn) {
++                        const int nb = cwn*WN_TILES*MMA_N + wn*MMA_N;
++                        const int brow = nb + lane_n8 + ((lane>>4)*8);
++                        const int bkb = kf*FRAG_BYTES + (((lane>>3)&1)*16);
++                        const int bl = brow*ROW_BYTES + bkb;
++                        const int bmask = ((brow >> 1) & 3) << 4;
++                        ldmatrix_x4(br[wn], smB_b + uint32_t(bl ^ bmask));
++                    }
++
++                    uint32_t a0[4], a1[4], a2[4], a3[4];
++                    {
++                        const int akb = (lane>>4)*16 + kf*FRAG_BYTES;
++                        const int ar0 = consumer_wg_id*BM_WG + 0*MMA_M + (lane&15);
++                        const int ar1 = consumer_wg_id*BM_WG + 1*MMA_M + (lane&15);
++                        const int ar2 = consumer_wg_id*BM_WG + 2*MMA_M + (lane&15);
++                        const int ar3 = consumer_wg_id*BM_WG + 3*MMA_M + (lane&15);
++                        const int am0 = ((ar0 >> 1) & 3) << 4;
++                        const int am1 = ((ar1 >> 1) & 3) << 4;
++                        const int am2 = ((ar2 >> 1) & 3) << 4;
++                        const int am3 = ((ar3 >> 1) & 3) << 4;
++                        ldmatrix_x4(a0, smA_b + uint32_t((ar0*ROW_BYTES + akb) ^ am0));
++                        ldmatrix_x4(a1, smA_b + uint32_t((ar1*ROW_BYTES + akb) ^ am1));
++                        ldmatrix_x4(a2, smA_b + uint32_t((ar2*ROW_BYTES + akb) ^ am2));
++                        ldmatrix_x4(a3, smA_b + uint32_t((ar3*ROW_BYTES + akb) ^ am3));
++                    }
++
++                    const uint32_t sa0 = sa_c[0][kf];
++                    const uint32_t sa1 = sa_c[1][kf];
++                    const uint32_t sa2 = sa_c[2][kf];
++                    const uint32_t sa3 = sa_c[3][kf];
++
++                    mma_nvfp4(c_frag[0][0][0],c_frag[0][0][1],c_frag[0][0][2],c_frag[0][0][3],
++                              a0[0],a0[1],a0[2],a0[3], br[0][0],br[0][1],
++                              c_frag[0][0][0],c_frag[0][0][1],c_frag[0][0][2],c_frag[0][0][3],
++                              sa0, sb0_c[0][kf]);
++                    mma_nvfp4(c_frag[0][0][4],c_frag[0][0][5],c_frag[0][0][6],c_frag[0][0][7],
++                              a0[0],a0[1],a0[2],a0[3], br[0][2],br[0][3],
++                              c_frag[0][0][4],c_frag[0][0][5],c_frag[0][0][6],c_frag[0][0][7],
++                              sa0, sb1_c[0][kf]);
++                    mma_nvfp4(c_frag[0][1][0],c_frag[0][1][1],c_frag[0][1][2],c_frag[0][1][3],
++                              a0[0],a0[1],a0[2],a0[3], br[1][0],br[1][1],
++                              c_frag[0][1][0],c_frag[0][1][1],c_frag[0][1][2],c_frag[0][1][3],
++                              sa0, sb0_c[1][kf]);
++                    mma_nvfp4(c_frag[0][1][4],c_frag[0][1][5],c_frag[0][1][6],c_frag[0][1][7],
++                              a0[0],a0[1],a0[2],a0[3], br[1][2],br[1][3],
++                              c_frag[0][1][4],c_frag[0][1][5],c_frag[0][1][6],c_frag[0][1][7],
++                              sa0, sb1_c[1][kf]);
++
++                    mma_nvfp4(c_frag[1][0][0],c_frag[1][0][1],c_frag[1][0][2],c_frag[1][0][3],
++                              a1[0],a1[1],a1[2],a1[3], br[0][0],br[0][1],
++                              c_frag[1][0][0],c_frag[1][0][1],c_frag[1][0][2],c_frag[1][0][3],
++                              sa1, sb0_c[0][kf]);
++                    mma_nvfp4(c_frag[1][0][4],c_frag[1][0][5],c_frag[1][0][6],c_frag[1][0][7],
++                              a1[0],a1[1],a1[2],a1[3], br[0][2],br[0][3],
++                              c_frag[1][0][4],c_frag[1][0][5],c_frag[1][0][6],c_frag[1][0][7],
++                              sa1, sb1_c[0][kf]);
++                    mma_nvfp4(c_frag[1][1][0],c_frag[1][1][1],c_frag[1][1][2],c_frag[1][1][3],
++                              a1[0],a1[1],a1[2],a1[3], br[1][0],br[1][1],
++                              c_frag[1][1][0],c_frag[1][1][1],c_frag[1][1][2],c_frag[1][1][3],
++                              sa1, sb0_c[1][kf]);
++                    mma_nvfp4(c_frag[1][1][4],c_frag[1][1][5],c_frag[1][1][6],c_frag[1][1][7],
++                              a1[0],a1[1],a1[2],a1[3], br[1][2],br[1][3],
++                              c_frag[1][1][4],c_frag[1][1][5],c_frag[1][1][6],c_frag[1][1][7],
++                              sa1, sb1_c[1][kf]);
++
++                    mma_nvfp4(c_frag[2][0][0],c_frag[2][0][1],c_frag[2][0][2],c_frag[2][0][3],
++                              a2[0],a2[1],a2[2],a2[3], br[0][0],br[0][1],
++                              c_frag[2][0][0],c_frag[2][0][1],c_frag[2][0][2],c_frag[2][0][3],
++                              sa2, sb0_c[0][kf]);
++                    mma_nvfp4(c_frag[2][0][4],c_frag[2][0][5],c_frag[2][0][6],c_frag[2][0][7],
++                              a2[0],a2[1],a2[2],a2[3], br[0][2],br[0][3],
++                              c_frag[2][0][4],c_frag[2][0][5],c_frag[2][0][6],c_frag[2][0][7],
++                              sa2, sb1_c[0][kf]);
++                    mma_nvfp4(c_frag[2][1][0],c_frag[2][1][1],c_frag[2][1][2],c_frag[2][1][3],
++                              a2[0],a2[1],a2[2],a2[3], br[1][0],br[1][1],
++                              c_frag[2][1][0],c_frag[2][1][1],c_frag[2][1][2],c_frag[2][1][3],
++                              sa2, sb0_c[1][kf]);
++                    mma_nvfp4(c_frag[2][1][4],c_frag[2][1][5],c_frag[2][1][6],c_frag[2][1][7],
++                              a2[0],a2[1],a2[2],a2[3], br[1][2],br[1][3],
++                              c_frag[2][1][4],c_frag[2][1][5],c_frag[2][1][6],c_frag[2][1][7],
++                              sa2, sb1_c[1][kf]);
++
++                    mma_nvfp4(c_frag[3][0][0],c_frag[3][0][1],c_frag[3][0][2],c_frag[3][0][3],
++                              a3[0],a3[1],a3[2],a3[3], br[0][0],br[0][1],
++                              c_frag[3][0][0],c_frag[3][0][1],c_frag[3][0][2],c_frag[3][0][3],
++                              sa3, sb0_c[0][kf]);
++                    mma_nvfp4(c_frag[3][0][4],c_frag[3][0][5],c_frag[3][0][6],c_frag[3][0][7],
++                              a3[0],a3[1],a3[2],a3[3], br[0][2],br[0][3],
++                              c_frag[3][0][4],c_frag[3][0][5],c_frag[3][0][6],c_frag[3][0][7],
++                              sa3, sb1_c[0][kf]);
++                    mma_nvfp4(c_frag[3][1][0],c_frag[3][1][1],c_frag[3][1][2],c_frag[3][1][3],
++                              a3[0],a3[1],a3[2],a3[3], br[1][0],br[1][1],
++                              c_frag[3][1][0],c_frag[3][1][1],c_frag[3][1][2],c_frag[3][1][3],
++                              sa3, sb0_c[1][kf]);
++                    mma_nvfp4(c_frag[3][1][4],c_frag[3][1][5],c_frag[3][1][6],c_frag[3][1][7],
++                              a3[0],a3[1],a3[2],a3[3], br[1][2],br[1][3],
++                              c_frag[3][1][4],c_frag[3][1][5],c_frag[3][1][6],c_frag[3][1][7],
++                              sa3, sb1_c[1][kf]);
++                }
++                if (lane == 0) arrive(&mbar_empty[qidx]);
++                ++qidx;
++            }
++
++            // Ensure prior tile sK drain + metadata reads finished before overwriting
++            asm volatile("bar.sync %0, 128;\n" :: "r"(bar_pre) : "memory");
++
++            const int wg_row_base = block_m + consumer_wg_id * BM_WG;
++            if (tid_in_wg < BM_WG) {
++                const int gr = wg_row_base + tid_in_wg;
++                smNormA[consumer_wg_id][tid_in_wg] = (gr < cache_rows) ? norm_x[gr] : 0.0f;
++            }
++            {
++                const int col = block_n + tid_in_wg;
++                if (col < active_cols) {
++                    smNormB[consumer_wg_id][tid_in_wg] = norm_w[col];
++                    smSelB[consumer_wg_id][tid_in_wg]  = selected_indices[col];
++                    smSlots[consumer_wg_id][tid_in_wg] = slots[col];
++                } else {
++                    smNormB[consumer_wg_id][tid_in_wg] = 0.0f;
++                    smSelB[consumer_wg_id][tid_in_wg]  = -1;
++                    smSlots[consumer_wg_id][tid_in_wg] = 0;
++                }
++            }
++            asm volatile("bar.sync %0, 128;\n" :: "r"(bar_post) : "memory");
++
++            #pragma unroll
++            for (int wm = 0; wm < WM_TILES; ++wm) {
++                const int r0 = wm * MMA_M + gid;
++                const int r1 = r0 + 8;
++                const int gr0 = wg_row_base + r0;
++                const int gr1 = wg_row_base + r1;
++                const float na0 = smNormA[consumer_wg_id][r0];
++                const float na1 = smNormA[consumer_wg_id][r1];
++                #pragma unroll
++                for (int wn = 0; wn < WN_TILES; ++wn) {
++                    const int c0 = cwn * WN_TILES * MMA_N + wn * MMA_N + tig * 2;
++                    const int c1 = c0 + 1;
++                    const int c2 = c0 + 8;
++                    const int c3 = c2 + 1;
++                    const float nb0 = smNormB[consumer_wg_id][c0];
++                    const float nb1 = smNormB[consumer_wg_id][c1];
++                    const float nb2 = smNormB[consumer_wg_id][c2];
++                    const float nb3 = smNormB[consumer_wg_id][c3];
++                    const int sb0 = smSelB[consumer_wg_id][c0];
++                    const int sb1 = smSelB[consumer_wg_id][c1];
++                    const int sb2 = smSelB[consumer_wg_id][c2];
++                    const int sb3 = smSelB[consumer_wg_id][c3];
++                    float* cr = c_frag[wm][wn];
++                    sK[consumer_wg_id][c0][r0] = rbf_to_half(na0, nb0, cr[0], gamma, gr0 == sb0);
++                    sK[consumer_wg_id][c1][r0] = rbf_to_half(na0, nb1, cr[1], gamma, gr0 == sb1);
++                    sK[consumer_wg_id][c0][r1] = rbf_to_half(na1, nb0, cr[2], gamma, gr1 == sb0);
++                    sK[consumer_wg_id][c1][r1] = rbf_to_half(na1, nb1, cr[3], gamma, gr1 == sb1);
++                    sK[consumer_wg_id][c2][r0] = rbf_to_half(na0, nb2, cr[4], gamma, gr0 == sb2);
++                    sK[consumer_wg_id][c3][r0] = rbf_to_half(na0, nb3, cr[5], gamma, gr0 == sb3);
++                    sK[consumer_wg_id][c2][r1] = rbf_to_half(na1, nb2, cr[6], gamma, gr1 == sb2);
++                    sK[consumer_wg_id][c3][r1] = rbf_to_half(na1, nb3, cr[7], gamma, gr1 == sb3);
++                }
++            }
++
++            asm volatile("bar.sync %0, 128;\n" :: "r"(bar_post) : "memory");
++
++            constexpr int row_pairs = BM_WG / 2;  // 32
++            for (int p = tid_in_wg; p < BN * row_pairs; p += 128) {
++                const int col_local = p >> 5;
++                const int row_local = (p & 31) * 2;
++                const int gr = wg_row_base + row_local;
++                if (block_n + col_local < active_cols && gr < cache_rows) {
++                    __half* dst = cache + static_cast<size_t>(smSlots[consumer_wg_id][col_local]) * cache_rows + gr;
++                    if (gr + 1 < cache_rows && ((cache_rows & 1) == 0)) {
++                        const uint32_t packed_val = *reinterpret_cast<const uint32_t*>(
++                            &sK[consumer_wg_id][col_local][row_local]);
++                        *reinterpret_cast<uint32_t*>(dst) = packed_val;
++                    } else {
++                        dst[0] = sK[consumer_wg_id][col_local][row_local];
++                        if (gr + 1 < cache_rows) {
++                            dst[1] = sK[consumer_wg_id][col_local][row_local + 1];
++                        }
++                    }
++                }
++            }
++
++            #pragma unroll 4
++            for (int wm=0;wm<WM_TILES;++wm)
++                #pragma unroll 2
++                for (int wn=0;wn<WN_TILES;++wn)
++                    #pragma unroll 8
++                    for (int i=0;i<8;++i) c_frag[wm][wn][i]=0.f;
++        }
++    }
++}
++
+ struct Context {
+   int rows = 0;
+   int max_cols = 0;
+@@ -612,6 +967,7 @@ struct Context {
+   float* norm_x = nullptr;
+   float* norm_w = nullptr;
+   int* selected_indices = nullptr;
++  int* identity_indices = nullptr;
+   __nv_bfloat16* panel_full = nullptr;
+   __nv_bfloat16* panel_square = nullptr;
+   CUtensorMap tma_x{};
+@@ -631,6 +987,7 @@ void release_context(Context* context)
+   for (int* pointer : context->full_tile_ids) { cudaFree(pointer); }
+   cudaFree(context->panel_square);
+   cudaFree(context->panel_full);
++  cudaFree(context->identity_indices);
+   cudaFree(context->selected_indices);
+   cudaFree(context->norm_w);
+   cudaFree(context->norm_x);
+@@ -680,6 +1037,9 @@ bool allocate_context(Context* context)
+          cudaMalloc(&context->selected_indices,
+                     static_cast<std::size_t>(context->max_cols) * sizeof(int)) ==
+            cudaSuccess &&
++         cudaMalloc(&context->identity_indices,
++                    static_cast<std::size_t>(context->max_cols) * sizeof(int)) ==
++           cudaSuccess &&
+          cudaMalloc(&context->panel_full,
+                     full_elements * sizeof(__nv_bfloat16)) == cudaSuccess &&
+          cudaMalloc(&context->panel_square,
+@@ -748,11 +1108,18 @@ Context* create_empty_context(int rows, int max_cols, int features)
+   return context;
+ }
+ 
++__global__ void fill_identity_indices(int* indices, int count)
++{
++  const int i = blockIdx.x * blockDim.x + threadIdx.x;
++  if (i < count) { indices[i] = i; }
++}
++
+ bool finish_context(Context* context, cudaStream_t stream)
+ {
+   constexpr int threads = 256;
+   const std::size_t quant_tasks =
+     static_cast<std::size_t>(context->rows) * (context->features / MMA_K);
++  fill_identity_indices<<<launch_blocks(context->max_cols, threads), threads, 0, stream>>>(context->identity_indices, context->max_cols);
+   repack_scales<<<launch_blocks(quant_tasks, threads), threads, 0, stream>>>(
+     context->scale_x_row, context->scale_x_tiled, context->rows, context->features);
+   coherent_row_norms<<<launch_blocks(context->rows, 8), threads, 0, stream>>>(
+@@ -842,6 +1209,49 @@ extern "C" void* coherent_nvfp4_create_context_col_major(
+   return context;
+ }
+ 
++extern "C" void* coherent_nvfp4_create_subcontext(void* opaque_parent,
++                                                  const int* row_indices,
++                                                  int active_rows,
++                                                  int padded_rows,
++                                                  void* stream_pointer)
++{
++  auto* parent = static_cast<Context*>(opaque_parent);
++  if (!parent || !row_indices || active_rows <= 0 || active_rows > parent->rows ||
++      padded_rows < active_rows || padded_rows % BM) {
++    return nullptr;
++  }
++  auto* context = create_empty_context(padded_rows, parent->max_cols, parent->features);
++  if (!context) { return nullptr; }
++
++  cudaStream_t stream = reinterpret_cast<cudaStream_t>(stream_pointer);
++  constexpr int threads = 256;
++  const int row_bytes = parent->features / PACK_RATIO;
++  const std::size_t packed_tasks =
++    static_cast<std::size_t>(padded_rows) * row_bytes;
++  gather_packed_rows<<<launch_blocks(packed_tasks, threads), threads, 0, stream>>>(
++    parent->packed_x,
++    row_indices,
++    context->packed_x,
++    active_rows,
++    padded_rows,
++    row_bytes);
++  const int words_per_row = parent->features / MMA_K;
++  const std::size_t scale_tasks =
++    static_cast<std::size_t>(padded_rows) * words_per_row;
++  gather_row_scales<<<launch_blocks(scale_tasks, threads), threads, 0, stream>>>(
++    parent->scale_x_row,
++    row_indices,
++    context->scale_x_row,
++    active_rows,
++    padded_rows,
++    words_per_row);
++  if (!finish_context(context, stream)) {
++    release_context(context);
++    return nullptr;
++  }
++  return context;
++}
++
+ extern "C" int coherent_nvfp4_gather(void* opaque_context,
+                                       const int* indices,
+                                       int active_cols,
+@@ -910,29 +1320,21 @@ extern "C" int coherent_nvfp4_materialize_kww_fp16(void* opaque_context,
+   const int total_tiles = context->square_tile_counts[schedule];
+   const int grid = std::min(total_tiles, context->sms);
+   cudaStream_t stream = reinterpret_cast<cudaStream_t>(stream_pointer);
+-  sm120_nvfp4_gemm_v10h_kernel<<<grid, THREADS, 0, stream>>>(
++  sm120_nvfp4_rbf_fused_kernel<<<grid, THREADS, 0, stream>>>(
+     context->tma_w,
+     context->tma_w,
+-    context->tma_square,
+-    context->panel_square,
+     context->scale_w_tiled,
+     context->scale_w_tiled,
+     context->square_tile_ids[schedule],
+-    padded_cols,
+-    padded_cols,
+-    context->features,
+-    total_tiles,
+-    0,
+-    0,
+-    nullptr);
+-  constexpr int threads = 256;
+-  const std::size_t elements = static_cast<std::size_t>(active_cols) * active_cols;
+-  transform_kww<<<launch_blocks(elements, threads), threads, 0, stream>>>(
+-    context->panel_square,
+     context->norm_w,
++    context->norm_w,
++    context->identity_indices,
++    context->identity_indices,
+     output,
+     active_cols,
+-    context->max_cols,
++    active_cols,
++    context->features,
++    total_tiles,
+     gamma);
+   return int(cudaPeekAtLastError());
+ }
+@@ -954,31 +1356,12 @@ extern "C" int coherent_nvfp4_materialize_slotted_fp16(void* opaque_context,
+   const int total_tiles = context->full_tile_counts[schedule];
+   const int grid = std::min(total_tiles, context->sms);
+   cudaStream_t stream = reinterpret_cast<cudaStream_t>(stream_pointer);
+-  sm120_nvfp4_gemm_v10h_kernel<<<grid, THREADS, 0, stream>>>(
++  sm120_nvfp4_rbf_fused_kernel<<<grid, THREADS, 0, stream>>>(
+     context->tma_x,
+     context->tma_w,
+-    context->tma_full,
+-    context->panel_full,
+     context->scale_x_tiled,
+     context->scale_w_tiled,
+     context->full_tile_ids[schedule],
+-    context->rows,
+-    padded_cols,
+-    context->features,
+-    total_tiles,
+-    0,
+-    0,
+-    nullptr);
+-  constexpr int threads = 256;
+-  constexpr int tile_rows = 64;
+-  constexpr int tile_columns = 32;
+-  const int total_transform_tiles =
+-    ((context->rows + tile_rows - 1) / tile_rows) *
+-    ((active_cols + tile_columns - 1) / tile_columns);
+-  const int transform_grid =
+-    std::min(total_transform_tiles, context->sms * 4);
+-  transform_slotted_tiled<<<transform_grid, threads, 0, stream>>>(
+-    context->panel_full,
+     context->norm_x,
+     context->norm_w,
+     context->selected_indices,
+@@ -986,7 +1369,8 @@ extern "C" int coherent_nvfp4_materialize_slotted_fp16(void* opaque_context,
+     cache,
+     context->rows,
+     active_cols,
+-    context->max_cols,
++    context->features,
++    total_tiles,
+     gamma);
+   return int(cudaPeekAtLastError());
+ }
+@@ -1141,32 +1525,12 @@ extern "C" int coherent_nvfp4_materialize_slotted_prefix_fp16(
+   // build_sched_tiled_swizzle emits complete groups of eight M tiles in
+   // increasing order.  A prefix containing an integral number of groups is
+   // therefore exactly the first total_tiles entries of the full schedule.
+-  sm120_nvfp4_gemm_v10h_kernel<<<grid, THREADS, 0, stream>>>(
++  sm120_nvfp4_rbf_fused_kernel<<<grid, THREADS, 0, stream>>>(
+     context->tma_x,
+     context->tma_w,
+-    context->tma_full,
+-    context->panel_full,
+     context->scale_x_tiled,
+     context->scale_w_tiled,
+     context->full_tile_ids[schedule],
+-    prefix_rows,
+-    padded_cols,
+-    context->features,
+-    total_tiles,
+-    0,
+-    0,
+-    nullptr);
+-
+-  constexpr int threads = 256;
+-  constexpr int tile_rows = 64;
+-  constexpr int tile_columns = 32;
+-  const int total_transform_tiles =
+-    ((prefix_rows + tile_rows - 1) / tile_rows) *
+-    ((active_cols + tile_columns - 1) / tile_columns);
+-  const int transform_grid =
+-    std::min(total_transform_tiles, context->sms * 4);
+-  transform_slotted_tiled<<<transform_grid, threads, 0, stream>>>(
+-    context->panel_full,
+     context->norm_x,
+     context->norm_w,
+     context->selected_indices,
+@@ -1174,7 +1538,8 @@ extern "C" int coherent_nvfp4_materialize_slotted_prefix_fp16(
+     cache,
+     prefix_rows,
+     active_cols,
+-    context->max_cols,
++    context->features,
++    total_tiles,
+     gamma);
+   return int(cudaPeekAtLastError());
+ }
+diff --git a/research/svm/coherent_nvfp4_fp16_cache/coherent_nvfp4_runtime.h b/research/svm/coherent_nvfp4_fp16_cache/coherent_nvfp4_runtime.h
+index 40a3279..9866e39 100644
+--- a/research/svm/coherent_nvfp4_fp16_cache/coherent_nvfp4_runtime.h
++++ b/research/svm/coherent_nvfp4_fp16_cache/coherent_nvfp4_runtime.h
+@@ -62,4 +62,10 @@ extern "C" int coherent_nvfp4_reference_pairs_fp16(void* context,
+                                                     float gamma,
+                                                     void* stream);
+ 
++extern "C" void* coherent_nvfp4_create_subcontext(void* parent_context,
++                                                  const int* row_indices,
++                                                  int active_rows,
++                                                  int padded_rows,
++                                                  void* stream);
++
+ extern "C" void coherent_nvfp4_destroy_context(void* context);
